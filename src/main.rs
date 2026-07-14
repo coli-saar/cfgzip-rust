@@ -4,7 +4,6 @@ use clap::Parser;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use regex::Regex;
 use regex_automata::nfa::thompson::{State, NFA};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -183,10 +182,26 @@ fn gpt2_byte_decoder() -> HashMap<char, u8> {
     out
 }
 
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_byte_token(token: &str) -> Option<u8> {
+    let bytes = token.as_bytes();
+    if !matches!(bytes, [b'<', b'0', b'x', _, _, b'>']) {
+        return None;
+    }
+    Some((hex_nibble(bytes[3])? << 4) | hex_nibble(bytes[4])?)
+}
+
 fn token_to_bytes(token: &str, byte_decoder: &HashMap<char, u8>) -> Result<Vec<u8>> {
-    let re = Regex::new(r"^<0x([0-9A-Fa-f]{2})>$").unwrap();
-    if let Some(caps) = re.captures(token) {
-        return Ok(vec![u8::from_str_radix(&caps[1], 16)?]);
+    if let Some(byte) = hex_byte_token(token) {
+        return Ok(vec![byte]);
     }
     token
         .chars()
@@ -1251,6 +1266,8 @@ struct SearchState {
 struct StackInterner {
     stacks: Vec<Vec<usize>>,
     ids: FastHashMap<Vec<usize>, usize>,
+    push_cache: FastHashMap<(usize, usize), usize>,
+    prepend_cache: FastHashMap<(usize, usize, usize), usize>,
 }
 
 #[derive(Default)]
@@ -1288,6 +1305,8 @@ impl StackInterner {
         Self {
             stacks: vec![Vec::new()],
             ids,
+            push_cache: fast_hash_map(),
+            prepend_cache: fast_hash_map(),
         }
     }
 
@@ -1305,24 +1324,47 @@ impl StackInterner {
         if stack.is_empty() {
             return 0;
         }
+        if let Some(&id) = self.ids.get(stack) {
+            return id;
+        }
         self.intern_vec(stack.to_vec())
     }
 
     fn push(&mut self, stack_id: usize, sym: usize) -> usize {
+        let key = (stack_id, sym);
+        if let Some(&id) = self.push_cache.get(&key) {
+            return id;
+        }
         let mut stack = self.stacks[stack_id].clone();
         stack.push(sym);
-        self.intern_vec(stack)
+        let id = self.intern_vec(stack);
+        self.push_cache.insert(key, id);
+        id
     }
 
     fn prepend_to_tail(&mut self, prefix: &[usize], tail_id: usize, tail_start: usize) -> usize {
-        if prefix.is_empty() && tail_start == self.stacks[tail_id].len() {
+        let tail_len = self.stacks[tail_id].len();
+        if prefix.is_empty() && tail_start == tail_len {
             return 0;
+        }
+        if prefix.is_empty() && tail_start == 0 {
+            return tail_id;
+        }
+        let prefix_id = self.intern_slice(prefix);
+        if tail_start == tail_len {
+            return prefix_id;
+        }
+        let key = (prefix_id, tail_id, tail_start);
+        if let Some(&id) = self.prepend_cache.get(&key) {
+            return id;
         }
         let tail = &self.stacks[tail_id];
         let mut stack = Vec::with_capacity(prefix.len() + tail.len().saturating_sub(tail_start));
         stack.extend_from_slice(prefix);
         stack.extend_from_slice(&tail[tail_start..]);
-        self.intern_vec(stack)
+        let id = self.intern_vec(stack);
+        self.prepend_cache.insert(key, id);
+        id
     }
 
     fn first(&self, stack_id: usize) -> Option<usize> {
