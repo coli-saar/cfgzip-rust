@@ -2,83 +2,134 @@
 
 **Lossless token vocabulary compression for fast CFG-constrained decoding.**
 
-CFGzip is an offline pre-computation technique that pairs with a constrained decoding engine (e.g. XGrammar2), to 
-massively speed up the engine's inference compute time: generation with CFGzip+XGrammar2 is **up to 7.5x faster** than 
-the SoTA XGrammar2 alone. CFGzip compression is also **lossless**: outputs are byte-identical to the unmodified grammar 
-engine.
+CFGzip precomputes token equivalence classes for a fixed context-free grammar
+and tokenizer. At generation time, a grammar engine such as XGrammar2 can run on
+the much smaller class vocabulary, while CFGzip expands the resulting mask back
+to the model's full token vocabulary without changing which byte strings are
+accepted.
 
-## How it works:
+The offline preprocessor is now the Rust CLI, `cfgzip-preprocess`. The older
+Python preprocessor is deprecated and will be removed from the recommended
+workflow.
 
-Within a given context-free grammar (CFG), many tokens are **interchangeable**: at any point where one is valid, so are 
-the others, and vice versa. During the pre-compute phase, CFGzip detects these tokens and compresses them into a single 
-*equivalence class*, keeping one representative per class. These equivalence classes are then cached — in memory or on 
-disk (via `EquivalenceClassData.save()`) — to be used during generation.
+## How It Works
 
-At inference time, the grammar engine produces an allowed/disallowed mask over just the class representatives: this 
-shrinks the per-step search space from 100-200k tokens to (typically) 1-3k equivalence class representatives. A 
-`MaskTranslator` losslessly decompresses that class-level mask back to the full token vocabulary at each generation 
-step.
+Within a given grammar, many tokens are interchangeable: whenever one token is
+valid, the others in its equivalence class are valid too. CFGzip computes these
+classes once for a `(grammar, tokenizer)` pair and writes three artifacts:
 
-See [our paper](https://arxiv.org/abs/2605.29986) for a description of the compression algorithm and correctness proofs.
+- `tc.pt`: token id to class id
+- `inv.pt`: token ids that are invalid in every grammar context
+- `cr.pkl`: byte representatives for the compressed class vocabulary
 
-## When to use it
+At inference time, the grammar engine masks only the representative vocabulary
+instead of all 100k-200k model tokens. `MaskTranslator` then losslessly expands
+that class-level mask back to the full vocabulary.
 
-CFGzip is intended for **static, large, complex grammars** that are reused across multiple requests: code generation, 
-fixed schemas, structured DSLs. The offline compression step can take a few minutes, so it typically only pays off when 
-one grammar serves many generations. CFGzip is **not** intended for dynamic, per-request schemas where you'd have to pay 
-the precompute cost every time.
+See [our paper](https://arxiv.org/abs/2605.29986) for the compression algorithm
+and correctness proof.
+
+## When To Use It
+
+CFGzip is best for **static, reused grammars**: programming languages, fixed
+schemas, structured DSLs, XML-like formats, and other large grammars that serve
+many requests. The precompute step is offline work, so it usually pays off when
+the same grammar/tokenizer pair is reused across many generations.
+
+CFGzip is usually not a good fit for highly dynamic per-request schemas, where
+the precompute cost would be paid for every request.
 
 ## Install
 
+Install the Python runtime package for loading artifacts and using the
+generation-time processors:
+
 ```bash
-pip install cfgzip               # core: offline preprocessing
-pip install "cfgzip[xgrammar]"   # + the XGrammar generation backend
+pip install "cfgzip[xgrammar]"
 ```
 
-Requires Python ≥ 3.10.
+Build the Rust preprocessor from this repository:
+
+```bash
+cargo build --release
+```
+
+Use the release binary for real preprocessing. The repository configures
+aggressive release settings such as `target-cpu=native`, fat LTO, and one
+codegen unit, so release builds take longer but are the intended timing target.
 
 ## Quickstart
 
-CFGzip has two phases: an **offline** step that computes and caches equivalence classes for a `(grammar, tokenizer)` 
-pair, and an **online** step, where a third-party grammar engine does the heavy lifting — CFGzip just speeds things up.
+CFGzip has two phases:
 
-### 1. Offline compression
+1. Run the Rust CLI once to produce equivalence-class artifacts.
+2. Load those artifacts from Python during generation.
 
-```python
-from transformers import AutoTokenizer
-from cfgzip import preprocess
+### 1. Write A Grammar File
 
-tokenizer = AutoTokenizer.from_pretrained('gpt2')
-grammar = """\
+Create `/tmp/arithmetic.gbnf`:
+
+```gbnf
 root   ::= expr
 expr   ::= term (("+" | "-") term)*
 term   ::= factor (("*" | "/") factor)*
 factor ::= [0-9]+ | "(" expr ")"
-"""
-
-# eq is an EquivalenceClassData object: we can save it
-# to disk (like we did here) and/or just use it directly
-eq = preprocess(grammar, tokenizer, num_workers=4)
-eq.save('cfgzip_data/arithmetic')
 ```
 
-### 2. Online inference
+### 2. Preprocess With Rust
 
-`XgrammarProcessor` is a standard `transformers` `LogitsProcessor`, so it drops
-straight into `model.generate`:
+```bash
+target/release/cfgzip-preprocess \
+  --model-id gpt2 \
+  --grammar-file /tmp/arithmetic.gbnf \
+  --output cfgzip_data/arithmetic \
+  --num-threads 8
+```
+
+The output directory must not already contain files. Progress bars are shown for
+token preprocessing, class bucketing, and output writing. Pass `--no-progress`
+for quiet output.
+
+For gated HuggingFace models, set `HF_TOKEN` or pass `--hf-token`:
+
+```bash
+export HF_TOKEN=hf_...
+```
+
+Useful options:
+
+- `--model-id`: HuggingFace model id whose `tokenizer.json` should be used.
+- `--grammar-file`: path to a GBNF grammar file.
+- `--output`: empty or non-existent directory where artifacts will be written.
+- `--start-symbol`: grammar start rule, default `root`.
+- `--n-logits`: override the output logit vocabulary size.
+- `--ignore-range START..END`: exclude token ids, useful for special tokens.
+- `--skip-null-bytes`: put tokens containing `\x00` in singleton classes.
+- `--skip-repeat-bytes`: put tokens with repeated `***`, `+++`, or `---` bytes
+  in singleton classes.
+- `--num-threads`: Rayon worker count for token traversal.
+- `--cache-dir`: HuggingFace asset cache directory.
+
+### 3. Use The Artifacts During Generation
+
+`XgrammarProcessor` is a standard `transformers` `LogitsProcessor`:
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
 from cfgzip import XgrammarProcessor
 
-tokenizer = AutoTokenizer.from_pretrained('gpt2')
-model = AutoModelForCausalLM.from_pretrained('gpt2')
+grammar = open("/tmp/arithmetic.gbnf").read()
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+model = AutoModelForCausalLM.from_pretrained("gpt2")
 
 processor = XgrammarProcessor.auto_pipeline(
-    'cfgzip_data/arithmetic', tokenizer, grammar, device=model.device
+    "cfgzip_data/arithmetic",
+    tokenizer,
+    grammar,
+    device=model.device,
 )
 
-inputs = tokenizer('Calculator: ', return_tensors='pt').to(model.device)
+inputs = tokenizer("Calculator: ", return_tensors="pt").to(model.device)
 out = model.generate(
     **inputs,
     max_new_tokens=16,
@@ -87,83 +138,33 @@ out = model.generate(
 print(tokenizer.decode(out[0]))
 ```
 
-### Static-CFG fast path
-
-For the common case (one grammar, many batches) compile once and rebuild only the lightweight per-batch processor, 
-skipping redundant disk I/O and grammar compilation:
+For the common case of one grammar reused across many batches, compile once and
+rebuild only the lightweight per-batch processor:
 
 ```python
 from cfgzip import XgrammarProcessor
 
 mask_translator, compiled_grammar = XgrammarProcessor.load_and_compile(
-    'cfgzip_data/arithmetic', tokenizer, grammar, device=model.device
+    "cfgzip_data/arithmetic",
+    tokenizer,
+    grammar,
+    device=model.device,
 )
 
 for batch in batches:
     processor = XgrammarProcessor.from_compiled(mask_translator, compiled_grammar, tokenizer)
-    output = model.generate(**batch, logits_processor=LogitsProcessorList([processor]))
-    # ... do something
+    output = model.generate(
+        **batch,
+        logits_processor=LogitsProcessorList([processor]),
+    )
 ```
 
-`auto_pipeline` is just `load_and_compile` + `from_compiled`; use the split form above whenever you generate more than 
-once with the same grammar.
+`auto_pipeline` is just `load_and_compile` plus `from_compiled`; use the split
+form whenever the same grammar is used more than once.
 
-## Rust preprocessor CLI
+## Paper C++ Benchmark
 
-This repository also contains a standalone Rust preprocessor, `cfgzip-preprocess`, intended as a faster replacement for
-the Python offline preprocessing step. It downloads HuggingFace tokenizer assets, computes token equivalence classes, and
-writes the same artifact layout consumed by `EquivalenceClassData.load()`:
-
-- `tc.pt`
-- `inv.pt`
-- `cr.pkl`
-
-The Rust terminal-regex lowering uses `regex-automata`, so class counts may be smaller than the Python implementation
-when the Rust automaton merges states that are language-equivalent.
-
-### Build
-
-Install a Rust toolchain, then build the optimized CLI:
-
-```bash
-cargo build --release
-```
-
-The repository configures aggressive release settings (`target-cpu=native`, fat LTO, one codegen unit). Release builds
-take longer, but this is the binary to use for timing.
-
-### Run
-
-For gated HuggingFace models, set `HF_TOKEN` first:
-
-```bash
-export HF_TOKEN=hf_...
-```
-
-In fish:
-
-```fish
-set -gx HF_TOKEN hf_...
-```
-
-Run preprocessing with a GBNF grammar file:
-
-```bash
-target/release/cfgzip-preprocess \
-  --model-id meta-llama/Llama-3.2-3B-Instruct \
-  --grammar-file /path/to/grammar.gbnf \
-  --output /path/to/output_dir \
-  --ignore-range 128000..128255 \
-  --skip-repeat-bytes \
-  --num-threads 16
-```
-
-The output directory must not already contain files. A preprocessing progress bar is shown by default; pass
-`--no-progress` for quiet output.
-
-### Paper C++ benchmark
-
-To run the same C++ grammar used by `preprocess_grammars.py`, write it to a file:
+To run the same C++ grammar used by the paper scripts, write it to a file:
 
 ```bash
 python - <<'PY'
@@ -187,52 +188,60 @@ rm -rf /tmp/cfgzip_llama_cpp_rust
   --num-threads 16
 ```
 
-For an apples-to-apples Python comparison:
+## Grammar Format
 
-```bash
-rm -rf /tmp/cfgzip_llama_cpp_python
+Grammars are written in **GBNF** (GGML BNF), the grammar notation used by
+[llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md)
+and XGrammar2.
 
-/usr/bin/time -p python preprocess_grammars.py \
-  --model llama \
-  --task cpp \
-  --output /tmp/cfgzip_llama_cpp_python \
-  --num-workers 16
-```
+CFGzip currently parses core GBNF. Some advanced constructs, such as `{m,n}`
+repetition counts, are not supported yet.
 
-Use Python 3.10 or newer for the Python comparison.
+The start rule should be named `root`, or pass `--start-symbol`. The start
+symbol must not appear in any rule body; keep recursion on an inner
+non-terminal, as in `root ::= expr`.
 
-## Grammar format
+The same grammar string should be supplied to both the Rust preprocessor and
+the generation-time grammar engine.
 
-Grammars are written in **GBNF** (GGML BNF) — the grammar notation used by 
-[llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md) and XGrammar2. The same grammar 
-string drives both the offline `preprocess` step and online generation; see the linked guide for the full syntax.
+## Deprecated Python Preprocessor
 
-Two CFGzip-specific constraints:
+The Python `cfgzip.preprocessing.preprocess` API remains available for
+compatibility, but it is no longer the recommended offline path. New workflows
+should call `cfgzip-preprocess` and load the generated artifacts with
+`EquivalenceClassData.load()` or `XgrammarProcessor`.
 
-- CFGzip parses **core GBNF**; a few advanced constructs (e.g. `{m,n}` repetition counts) aren't supported yet.
-- The start rule must be named `root` (or pass `start_symbol=...` to `preprocess`), and the start symbol may **not** 
-  appear in any rule body — keep the recursion on an inner non-terminal, as in the `root ::= expr` quickstart grammar 
-  above.
+The Rust preprocessor may produce fewer classes than the Python implementation
+when `regex-automata` merges terminal-regex states that are language-equivalent;
+the artifact format and accepted byte strings remain compatible with the Python
+runtime.
 
-## Scope & limitations
+## Scope And Limitations
 
-- **Engine backend:** v0.1.0 supports **XGrammar2 only**. `BaseProcessor` defines the contract for adding support for additional engines. We plan to support llguidance and transformers-cfg in later versions.
-- **CFG notation:** similarly, `preprocess()` only supports the GBNF grammar specification notation used by XGrammar2. Support for additional specification notations (e.g. Lark) is planned alongside support for decoding engines that use them.
+- **Engine backend:** v0.1.0 supports XGrammar2 only. `BaseProcessor` defines
+  the extension point for adding engines such as llguidance or
+  transformers-cfg.
+- **Grammar notation:** v0.1.0 supports core GBNF. Support for additional
+  grammar formats is planned alongside additional decoding engines.
+- **Offline cost:** preprocessing can still take minutes for large grammars and
+  tokenizers. This is expected; the artifacts are intended to be reused.
 
 ## Public API
 
-| Name | Description                                                                                        |
-|---|----------------------------------------------------------------------------------------------------|
-| `preprocess` | Computes equivalence classes for a `(grammar, tokenizer)` pair (offline).                          |
-| `EquivalenceClassData` | The precomputed equivalence class data; `.save` / `.load` / `.to`.                                 |
-| `XgrammarProcessor` | XGrammar wrapper and `LogitsProcessor`; `.auto_pipeline` / `.load_and_compile` / `.from_compiled`. |
-| `MaskTranslator` | Expands a class-level mask back to the full token vocabulary in-place.                             |
-| `BaseProcessor` | Abstract base / extension point for adding a new grammar engine.                                   |
+| Name | Description |
+|---|---|
+| `cfgzip-preprocess` | Rust CLI that computes equivalence-class artifacts for a `(grammar, tokenizer)` pair. |
+| `EquivalenceClassData` | Loads and stores precomputed artifact data; `.load`, `.save`, `.to`. |
+| `XgrammarProcessor` | XGrammar wrapper and `LogitsProcessor`; `.auto_pipeline`, `.load_and_compile`, `.from_compiled`. |
+| `MaskTranslator` | Expands a class-level mask back to the full token vocabulary in-place. |
+| `BaseProcessor` | Abstract base and extension point for new grammar engines. |
+| `preprocess` | Deprecated Python offline preprocessor retained for compatibility. |
 
-## On AI usage
+## On AI Usage
 
-The main algorithm and functions were written by hand. We used Claude Code to port our research repository to a 
-pip-installable module, including writing tests, docstrings, and portions of this README.
+The main algorithm and functions were written by hand. We used Claude Code to
+port our research repository to a pip-installable module, including writing
+tests, docstrings, and portions of this README.
 
 ## Citation
 
