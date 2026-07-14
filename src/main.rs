@@ -1221,10 +1221,10 @@ struct EquivOut {
 
 #[derive(Clone)]
 struct IntGrammar {
-    preterms_rev: HashMap<u8, Vec<usize>>,
-    nt_map: HashMap<usize, Vec<usize>>,
-    transitions: HashMap<(usize, usize), Vec<Vec<usize>>>,
-    stack_adj: HashMap<usize, HashSet<Option<usize>>>,
+    preterms_rev: [Vec<usize>; 256],
+    nt_map: Vec<Vec<usize>>,
+    transitions: Vec<HashMap<usize, Vec<Vec<usize>>>>,
+    stack_adj: Vec<HashSet<Option<usize>>>,
     start: usize,
 }
 
@@ -1438,9 +1438,10 @@ fn advance_frontier(
     ig: &IntGrammar,
     stacks: &mut StackInterner,
 ) -> HashSet<SearchState> {
-    let Some(pts) = ig.preterms_rev.get(&byte) else {
+    let pts = &ig.preterms_rev[byte as usize];
+    if pts.is_empty() {
         return HashSet::new();
-    };
+    }
     let mut next_states = HashSet::new();
     for state in frontier {
         if stacks.is_empty(state.out_stack) {
@@ -1448,14 +1449,10 @@ fn advance_frontier(
                 continue;
             }
             for &pt in pts {
-                if let Some(starts) = ig.nt_map.get(&pt) {
+                if let Some(starts) = ig.nt_map.get(pt) {
                     for &s in starts {
-                        if ig
-                            .stack_adj
-                            .get(&s)
-                            .map_or(false, |a| a.contains(&state.prev_symbol))
-                        {
-                            if let Some(outs) = ig.transitions.get(&(pt, s)) {
+                        if ig.stack_adj[s].contains(&state.prev_symbol) {
+                            if let Some(outs) = ig.transitions[pt].get(&s) {
                                 for t0_out in outs {
                                     let ins = stacks.push(state.in_stack, s);
                                     let out_stack = stacks.intern_slice(t0_out);
@@ -1474,7 +1471,7 @@ fn advance_frontier(
         } else {
             let head = stacks.first(state.out_stack).unwrap();
             for &pt in pts {
-                if let Some(outs) = ig.transitions.get(&(pt, head)) {
+                if let Some(outs) = ig.transitions[pt].get(&head) {
                     for t0_out in outs {
                         let new_out = stacks.prepend_to_tail(t0_out, state.out_stack, 1);
                         next_states.insert(SearchState {
@@ -1687,6 +1684,7 @@ fn compute_token_classes(
         let id = symbols.len();
         symbols.insert(s, id);
     }
+    let n_symbols = symbols.len();
     let mut g_int: HashMap<usize, Vec<Vec<usize>>> = HashMap::new();
     for (a, prods) in grammar {
         let aid = symbols[a];
@@ -1699,32 +1697,38 @@ fn compute_token_classes(
     }
     let stack_adj = compute_stack_adj(&g_int, 0);
     let token_chars: HashSet<u8> = tokens.iter().flat_map(|(t, _)| t.iter().copied()).collect();
-    let mut preterms_rev: HashMap<u8, Vec<usize>> = HashMap::new();
+    let mut preterms_rev: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
     for (k, bytes) in preterms {
         let Some(&kid) = symbols.get(k) else {
             continue;
         };
         for &b in bytes {
             if token_chars.contains(&b) {
-                preterms_rev.entry(b).or_default().push(kid);
+                preterms_rev[b as usize].push(kid);
             }
         }
     }
-    let mut nt_map: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut transitions: HashMap<(usize, usize), Vec<Vec<usize>>> = HashMap::new();
+    let mut nt_map = vec![Vec::new(); n_symbols];
+    let mut transitions = vec![HashMap::<usize, Vec<Vec<usize>>>::new(); n_symbols];
     for (a, prods) in &g_int {
         for beta in prods {
             if let Some((&b, rest)) = beta.split_first() {
-                transitions.entry((b, *a)).or_default().push(rest.to_vec());
-                nt_map.entry(b).or_default().push(*a);
+                transitions[b].entry(*a).or_default().push(rest.to_vec());
+                nt_map[b].push(*a);
             }
+        }
+    }
+    let mut stack_adj_vec = vec![HashSet::new(); n_symbols];
+    for (sym, adj) in stack_adj {
+        if sym < stack_adj_vec.len() {
+            stack_adj_vec[sym] = adj;
         }
     }
     let ig = IntGrammar {
         preterms_rev,
         nt_map,
         transitions,
-        stack_adj,
+        stack_adj: stack_adj_vec,
         start: 0,
     };
 
@@ -2480,11 +2484,15 @@ mod tests {
 
     #[test]
     fn token_trie_reuses_prefix_frontiers() {
+        let mut preterms_rev: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
+        preterms_rev[b'a' as usize] = vec![1];
+        let mut transitions = vec![HashMap::<usize, Vec<Vec<usize>>>::new(); 2];
+        transitions[1].insert(0, vec![Vec::new(), vec![0]]);
         let ig = IntGrammar {
-            preterms_rev: HashMap::from([(b'a', vec![1])]),
-            nt_map: HashMap::from([(1, vec![0])]),
-            transitions: HashMap::from([((1, 0), vec![Vec::new(), vec![0]])]),
-            stack_adj: HashMap::from([(0, HashSet::new())]),
+            preterms_rev,
+            nt_map: vec![Vec::new(), vec![0]],
+            transitions,
+            stack_adj: vec![HashSet::new(), HashSet::new()],
             start: 0,
         };
         let tasks = vec![(vec![b'a'], 10), (vec![b'a', b'a'], 11), (vec![b'b'], 12)];
