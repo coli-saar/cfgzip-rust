@@ -22,11 +22,8 @@ import os
 import time
 import argparse
 from tqdm import tqdm
-from datasets import load_dataset
-from transformers import AutoTokenizer
 
-from grammars import json_schema, xml, cpp, bython
-from cfgzip import preprocess
+from cfgzip.preprocessing.preprocess import preprocess
 
 
 MODEL_CONFIGS = {
@@ -46,7 +43,7 @@ MODEL_CONFIGS = {
         "n_logits": 151936,
     },
 }
-GRAMMAR_MODULES = {"cpp": cpp, "bython": bython, "xml": xml}
+GRAMMAR_MODULE_NAMES = {"cpp": "grammars.cpp", "bython": "grammars.bython", "xml": "grammars.xml_cfg"}
 TASKS_WITH_SKIP_TOKENS = {"cpp", "bython"}
 
 
@@ -62,6 +59,8 @@ def parse_args(argv=None):
 
 
 def main(args):
+    from transformers import AutoTokenizer
+
     config = MODEL_CONFIGS[args.model]
     token = args.hf_token or os.environ.get("HF_TOKEN")
     tokenizer = AutoTokenizer.from_pretrained(config["model_id"], **({"token": token} if token else {}))
@@ -88,6 +87,9 @@ def main(args):
 
     t0 = time.perf_counter()
     if args.task == "json":
+        from datasets import load_dataset
+        from grammars import json_schema
+
         # \x00-byte tokens get their own singleton class for json: xgrammar's runtime rejects any
         # token whose bytes contain \x00 as a special control token, but cfgzip's grammar accepts
         # \x00 via classes like [^/]. Without skipping, the null-byte token becomes the shortest
@@ -105,8 +107,11 @@ def main(args):
             eq_data = preprocess(grammar_spec.xgrammar_str, tokenizer, **preprocess_kwargs)
             eq_data.save(f"{args.output}/schema_{i}")
     else:
+        import importlib
+
+        grammar_module = importlib.import_module(GRAMMAR_MODULE_NAMES[args.task])
         eq_data = preprocess(
-            GRAMMAR_MODULES[args.task].xgrammar_str, tokenizer, use_tqdm=True, **preprocess_kwargs,
+            grammar_module.grammar_spec.xgrammar_str, tokenizer, use_tqdm=True, **preprocess_kwargs,
         )
         eq_data.save(args.output)
 
