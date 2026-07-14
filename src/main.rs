@@ -1222,6 +1222,25 @@ struct IntGrammar {
     start: usize,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SearchState {
+    in_stack: Vec<usize>,
+    out_stack: Vec<usize>,
+    prev_symbol: Option<usize>,
+    allow_bt: bool,
+}
+
+#[derive(Default)]
+struct TokenTrieNode {
+    children: HashMap<u8, usize>,
+    token_ids: Vec<usize>,
+}
+
+struct TrieJob {
+    node_id: usize,
+    frontier: HashSet<SearchState>,
+}
+
 fn compute_stack_adj(
     grammar: &HashMap<usize, Vec<Vec<usize>>>,
     start: usize,
@@ -1272,67 +1291,89 @@ fn compute_stack_adj(
     adj
 }
 
-fn stack_in_out(tok: &[u8], ig: &IntGrammar) -> Option<HashSet<(Vec<usize>, Vec<usize>)>> {
-    if tok.is_empty() || !ig.preterms_rev.contains_key(&tok[0]) {
-        return None;
+fn build_token_trie(tasks: &[(Vec<u8>, usize)]) -> Vec<TokenTrieNode> {
+    let mut nodes = vec![TokenTrieNode::default()];
+    for (tok, id) in tasks {
+        let mut node = 0usize;
+        for &b in tok {
+            if let Some(&next) = nodes[node].children.get(&b) {
+                node = next;
+            } else {
+                let next = nodes.len();
+                nodes.push(TokenTrieNode::default());
+                nodes[node].children.insert(b, next);
+                node = next;
+            }
+        }
+        nodes[node].token_ids.push(*id);
     }
-    let mut out = HashSet::new();
-    rec_token(tok, vec![], vec![], None, true, ig, &mut out);
-    if ig.preterms_rev[&tok[0]]
-        .iter()
-        .any(|pt| ig.nt_map.get(pt).map_or(false, |xs| xs.contains(&ig.start)))
-    {
-        rec_token(
-            tok,
-            vec![ig.start],
-            vec![ig.start],
-            None,
-            false,
-            ig,
-            &mut out,
-        );
-    }
-    (!out.is_empty()).then_some(out)
+    nodes
 }
 
-fn rec_token(
-    tok: &[u8],
-    in0: Vec<usize>,
-    out0: Vec<usize>,
-    prev: Option<usize>,
-    allow_bt: bool,
+fn compute_subtree_token_counts(nodes: &[TokenTrieNode]) -> Vec<usize> {
+    fn rec(nodes: &[TokenTrieNode], node_id: usize, counts: &mut [usize]) -> usize {
+        let node = &nodes[node_id];
+        let mut total = node.token_ids.len();
+        for &child_id in node.children.values() {
+            total += rec(nodes, child_id, counts);
+        }
+        counts[node_id] = total;
+        total
+    }
+    let mut counts = vec![0usize; nodes.len()];
+    rec(nodes, 0, &mut counts);
+    counts
+}
+
+fn initial_frontier(start: usize) -> HashSet<SearchState> {
+    HashSet::from([
+        SearchState {
+            in_stack: Vec::new(),
+            out_stack: Vec::new(),
+            prev_symbol: None,
+            allow_bt: true,
+        },
+        SearchState {
+            in_stack: vec![start],
+            out_stack: vec![start],
+            prev_symbol: None,
+            allow_bt: false,
+        },
+    ])
+}
+
+fn advance_frontier(
+    frontier: &HashSet<SearchState>,
+    byte: u8,
     ig: &IntGrammar,
-    results: &mut HashSet<(Vec<usize>, Vec<usize>)>,
-) {
-    let mut stack = vec![(0usize, in0, out0, prev)];
-    let mut seen = HashSet::new();
-    while let Some((pos, in_stack, out_stack, prev_symbol)) = stack.pop() {
-        if !seen.insert((pos, in_stack.clone(), out_stack.clone())) {
-            continue;
-        }
-        if pos == tok.len() {
-            results.insert((in_stack, out_stack));
-            continue;
-        }
-        let Some(pts) = ig.preterms_rev.get(&tok[pos]) else {
-            continue;
-        };
-        if out_stack.is_empty() {
-            if allow_bt {
-                for &pt in pts {
-                    if let Some(starts) = ig.nt_map.get(&pt) {
-                        for &s in starts {
-                            if ig
-                                .stack_adj
-                                .get(&s)
-                                .map_or(false, |a| a.contains(&prev_symbol))
-                            {
-                                if let Some(outs) = ig.transitions.get(&(pt, s)) {
-                                    for t0_out in outs {
-                                        let mut ins = in_stack.clone();
-                                        ins.push(s);
-                                        stack.push((pos + 1, ins, t0_out.clone(), Some(s)));
-                                    }
+) -> HashSet<SearchState> {
+    let Some(pts) = ig.preterms_rev.get(&byte) else {
+        return HashSet::new();
+    };
+    let mut next_states = HashSet::new();
+    for state in frontier {
+        if state.out_stack.is_empty() {
+            if !state.allow_bt {
+                continue;
+            }
+            for &pt in pts {
+                if let Some(starts) = ig.nt_map.get(&pt) {
+                    for &s in starts {
+                        if ig
+                            .stack_adj
+                            .get(&s)
+                            .map_or(false, |a| a.contains(&state.prev_symbol))
+                        {
+                            if let Some(outs) = ig.transitions.get(&(pt, s)) {
+                                for t0_out in outs {
+                                    let mut ins = state.in_stack.clone();
+                                    ins.push(s);
+                                    next_states.insert(SearchState {
+                                        in_stack: ins,
+                                        out_stack: t0_out.clone(),
+                                        prev_symbol: Some(s),
+                                        allow_bt: state.allow_bt,
+                                    });
                                 }
                             }
                         }
@@ -1340,18 +1381,177 @@ fn rec_token(
                 }
             }
         } else {
-            let head = out_stack[0];
+            let head = state.out_stack[0];
             for &pt in pts {
                 if let Some(outs) = ig.transitions.get(&(pt, head)) {
                     for t0_out in outs {
                         let mut new_out = t0_out.clone();
-                        new_out.extend_from_slice(&out_stack[1..]);
-                        stack.push((pos + 1, in_stack.clone(), new_out, Some(head)));
+                        new_out.extend_from_slice(&state.out_stack[1..]);
+                        next_states.insert(SearchState {
+                            in_stack: state.in_stack.clone(),
+                            out_stack: new_out,
+                            prev_symbol: Some(head),
+                            allow_bt: state.allow_bt,
+                        });
                     }
                 }
             }
         }
     }
+    next_states
+}
+
+fn frontier_stack_in_out(
+    frontier: &HashSet<SearchState>,
+) -> Option<HashSet<(Vec<usize>, Vec<usize>)>> {
+    let out = frontier
+        .iter()
+        .map(|s| (s.in_stack.clone(), s.out_stack.clone()))
+        .collect::<HashSet<_>>();
+    (!out.is_empty()).then_some(out)
+}
+
+fn collect_token_trie_results(
+    nodes: &[TokenTrieNode],
+    node_id: usize,
+    frontier: &HashSet<SearchState>,
+    ig: &IntGrammar,
+    out: &mut Vec<(usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>)>,
+) {
+    let node = &nodes[node_id];
+    let stackio = if node.token_ids.is_empty() {
+        None
+    } else {
+        frontier_stack_in_out(frontier)
+    };
+    for &id in &node.token_ids {
+        out.push((id, stackio.clone()));
+    }
+    let mut children = node.children.iter().collect::<Vec<_>>();
+    children.sort_unstable_by_key(|(b, _)| **b);
+    for (&byte, &child_id) in children {
+        let next = advance_frontier(frontier, byte, ig);
+        if !next.is_empty() {
+            collect_token_trie_results(nodes, child_id, &next, ig, out);
+        } else {
+            collect_invalid_subtree(nodes, child_id, out);
+        }
+    }
+}
+
+fn collect_invalid_subtree(
+    nodes: &[TokenTrieNode],
+    node_id: usize,
+    out: &mut Vec<(usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>)>,
+) {
+    let node = &nodes[node_id];
+    for &id in &node.token_ids {
+        out.push((id, None));
+    }
+    let mut children = node.children.iter().collect::<Vec<_>>();
+    children.sort_unstable_by_key(|(b, _)| **b);
+    for (_, &child_id) in children {
+        collect_invalid_subtree(nodes, child_id, out);
+    }
+}
+
+fn collect_token_trie_jobs(
+    nodes: &[TokenTrieNode],
+    subtree_token_counts: &[usize],
+    node_id: usize,
+    frontier: HashSet<SearchState>,
+    depth: usize,
+    ig: &IntGrammar,
+    immediate: &mut Vec<(usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>)>,
+    jobs: &mut Vec<TrieJob>,
+) {
+    const MAX_JOB_TOKENS: usize = 512;
+    const MAX_SPLIT_DEPTH: usize = 8;
+
+    if subtree_token_counts[node_id] <= MAX_JOB_TOKENS || depth >= MAX_SPLIT_DEPTH {
+        jobs.push(TrieJob { node_id, frontier });
+        return;
+    }
+
+    let node = &nodes[node_id];
+    let stackio = frontier_stack_in_out(&frontier);
+    for &id in &node.token_ids {
+        immediate.push((id, stackio.clone()));
+    }
+
+    let mut children = node.children.iter().collect::<Vec<_>>();
+    children.sort_unstable_by_key(|(b, _)| **b);
+    for (&byte, &child_id) in children {
+        let next = advance_frontier(&frontier, byte, ig);
+        if next.is_empty() {
+            collect_invalid_subtree(nodes, child_id, immediate);
+        } else {
+            collect_token_trie_jobs(
+                nodes,
+                subtree_token_counts,
+                child_id,
+                next,
+                depth + 1,
+                ig,
+                immediate,
+                jobs,
+            );
+        }
+    }
+}
+
+fn compute_stack_in_out_for_trie(
+    tasks: &[(Vec<u8>, usize)],
+    ig: &IntGrammar,
+    pb: Option<&ProgressBar>,
+) -> Vec<(usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>)> {
+    let trie = build_token_trie(tasks);
+    let subtree_token_counts = compute_subtree_token_counts(&trie);
+    let root_frontier = initial_frontier(ig.start);
+    let mut immediate_results = Vec::new();
+    let mut jobs = Vec::new();
+    for &id in &trie[0].token_ids {
+        immediate_results.push((id, None));
+    }
+    let mut root_children = trie[0].children.iter().collect::<Vec<_>>();
+    root_children.sort_unstable_by_key(|(b, _)| **b);
+    for (&byte, &child_id) in root_children {
+        let frontier = advance_frontier(&root_frontier, byte, ig);
+        if frontier.is_empty() {
+            collect_invalid_subtree(&trie, child_id, &mut immediate_results);
+        } else {
+            collect_token_trie_jobs(
+                &trie,
+                &subtree_token_counts,
+                child_id,
+                frontier,
+                1,
+                ig,
+                &mut immediate_results,
+                &mut jobs,
+            );
+        }
+    }
+    if let Some(pb) = pb {
+        pb.inc(immediate_results.len() as u64);
+    }
+    let job_results = jobs
+        .into_par_iter()
+        .map(|job| {
+            let mut out = Vec::new();
+            collect_token_trie_results(&trie, job.node_id, &job.frontier, ig, &mut out);
+            if let Some(pb) = pb {
+                pb.inc(out.len() as u64);
+            }
+            out
+        })
+        .collect::<Vec<_>>();
+    let mut results = immediate_results;
+    for mut job in job_results {
+        results.append(&mut job);
+    }
+    results.sort_unstable_by_key(|(id, _)| *id);
+    results
 }
 
 fn compute_token_classes(
@@ -1388,7 +1588,9 @@ fn compute_token_classes(
     let token_chars: HashSet<u8> = tokens.iter().flat_map(|(t, _)| t.iter().copied()).collect();
     let mut preterms_rev: HashMap<u8, Vec<usize>> = HashMap::new();
     for (k, bytes) in preterms {
-        let kid = symbols[k];
+        let Some(&kid) = symbols.get(k) else {
+            continue;
+        };
         for &b in bytes {
             if token_chars.contains(&b) {
                 preterms_rev.entry(b).or_default().push(kid);
@@ -1453,16 +1655,7 @@ fn compute_token_classes(
     } else {
         None
     };
-    let results: Vec<_> = tasks
-        .par_iter()
-        .map(|(tok, id)| {
-            let r = stack_in_out(tok, &ig);
-            if let Some(pb) = &pb {
-                pb.inc(1);
-            }
-            (*id, r)
-        })
-        .collect();
+    let results = compute_stack_in_out_for_trie(&tasks, &ig, pb.as_ref());
     if let Some(pb) = &pb {
         pb.finish();
     }
@@ -1632,6 +1825,84 @@ fn pickle_binint(out: &mut Vec<u8>, x: i32) {
 mod tests {
     use super::*;
 
+    fn test_args() -> Args {
+        Args {
+            model_id: "test-model".to_string(),
+            grammar_file: PathBuf::from("grammar.gbnf"),
+            output: PathBuf::from("out"),
+            start_symbol: "root".to_string(),
+            n_logits: None,
+            ignore_range: Vec::new(),
+            skip_null_bytes: false,
+            skip_repeat_bytes: false,
+            num_threads: 1,
+            hf_token: None,
+            cache_dir: None,
+            no_progress: true,
+        }
+    }
+
+    fn tok(s: &str, id: usize) -> (Vec<u8>, usize) {
+        (s.as_bytes().to_vec(), id)
+    }
+
+    fn tok_bytes(bytes: &[u8], id: usize) -> (Vec<u8>, usize) {
+        (bytes.to_vec(), id)
+    }
+
+    fn classify(grammar: &str, tokens: Vec<(Vec<u8>, usize)>, eos: usize) -> EquivOut {
+        classify_with_args(grammar, tokens, eos, test_args())
+    }
+
+    fn classify_with_args(
+        grammar: &str,
+        tokens: Vec<(Vec<u8>, usize)>,
+        eos: usize,
+        args: Args,
+    ) -> EquivOut {
+        let (cfg, nfa, preterms, labels) = parse_cfg_str(grammar, &args.start_symbol).unwrap();
+        let normed = normalize_cfg(cfg, nfa, labels).unwrap();
+        let n_logits = tokens
+            .iter()
+            .map(|(_, id)| *id)
+            .chain(std::iter::once(eos))
+            .max()
+            .unwrap()
+            + 1;
+        compute_token_classes(&normed, &preterms, &tokens, eos, n_logits, &args).unwrap()
+    }
+
+    fn normalized(grammar: &str) -> (Grammar, Preterms) {
+        let (cfg, nfa, preterms, labels) = parse_cfg_str(grammar, "root").unwrap();
+        (normalize_cfg(cfg, nfa, labels).unwrap(), preterms)
+    }
+
+    fn class_of(eq: &EquivOut, id: usize) -> i32 {
+        eq.token_classes[id]
+    }
+
+    fn assert_valid(eq: &EquivOut, id: usize) {
+        assert!(
+            class_of(eq, id) >= 0,
+            "token {id} should have a class; invalid={:?}, classes={:?}",
+            eq.invalid_tokens,
+            eq.token_classes
+        );
+        assert!(
+            !eq.invalid_tokens.contains(&(id as i32)),
+            "token {id} should not be invalid"
+        );
+    }
+
+    fn assert_invalid(eq: &EquivOut, id: usize) {
+        assert_eq!(class_of(eq, id), -1, "token {id} should be unassigned");
+        assert!(
+            eq.invalid_tokens.contains(&(id as i32)),
+            "token {id} should be listed as invalid; invalid={:?}",
+            eq.invalid_tokens
+        );
+    }
+
     fn matches(re: &str, s: &str) -> bool {
         regex::Regex::new(&format!("^(?:{re})$"))
             .unwrap()
@@ -1661,5 +1932,410 @@ mod tests {
         let aux = prods["root"].iter().next().unwrap()[0].clone();
         assert!(prods[&aux].contains(&vec!["item".to_string()]));
         assert!(prods[&aux].iter().any(|rhs| rhs.contains(&aux)));
+    }
+
+    #[test]
+    fn parser_handles_comments_multiline_groups_escapes_and_start_symbols() {
+        let grammar = r#"
+            # whole-line comments disappear
+            entry ::= (
+                "a#not-comment" [#b] "\n"
+                | item? "\t"
+            ) # inline comments disappear
+            item ::= "x\"y" | "\\"
+        "#;
+        let (terms, prods) = parse_gbnf(grammar).unwrap();
+        assert!(prods.contains_key("entry"));
+        assert!(prods.contains_key("item"));
+        assert!(terms.values().any(|rx| matches(rx, "a#not-comment#\n")));
+        assert!(terms.values().any(|rx| matches(rx, "\t")));
+        assert!(parse_cfg_str(grammar, "entry").is_ok());
+
+        let err = parse_cfg_str(grammar, "root").unwrap_err().to_string();
+        assert!(err.contains("start symbol"));
+        assert!(err.contains("entry"));
+    }
+
+    #[test]
+    fn parser_closure_holds_for_mixed_alternation_and_group_quantifiers() {
+        let grammar = r#"
+            root ::= ("pre" item | alt)+ "!"
+            item ::= [a-z]+
+            alt ::= "x" | "y"
+        "#;
+        let (terms, prods) = parse_gbnf(grammar).unwrap();
+        let known_nt = prods.keys().cloned().collect::<BTreeSet<_>>();
+        let known_t = terms.keys().cloned().collect::<BTreeSet<_>>();
+        for (lhs, rhss) in &prods {
+            for rhs in rhss {
+                for sym in rhs {
+                    assert!(
+                        known_nt.contains(sym) || known_t.contains(sym),
+                        "unknown symbol {sym:?} in {lhs} -> {rhs:?}"
+                    );
+                }
+            }
+        }
+        assert!(prods["root"].iter().any(|rhs| rhs.len() == 2));
+    }
+
+    #[test]
+    fn normalization_removes_epsilon_unary_unreachable_and_temporary_symbols() {
+        let grammar = r#"
+            root ::= a
+            a ::= b
+            b ::= c?
+            c ::= "x"
+            dead ::= "z"
+        "#;
+        let (normed, preterms) = normalized(grammar);
+        assert!(normed.contains_key("S"));
+        assert!(!normed.contains_key("dead"));
+        assert!(normed.keys().all(|k| !k.starts_with("PT[")));
+        assert!(normed
+            .values()
+            .all(|rhss| rhss.iter().all(|rhs| !rhs.is_empty())));
+        assert!(normed
+            .values()
+            .flat_map(|rhss| rhss.iter())
+            .all(|rhs| preterms.contains_key(&rhs[0])));
+    }
+
+    #[test]
+    fn normalization_handles_direct_and_indirect_left_recursion() {
+        let grammar = r#"
+            root ::= expr
+            expr ::= expr "+" atom | term
+            term ::= expr "-" atom | atom
+            atom ::= [0-9]+
+        "#;
+        let (normed, preterms) = normalized(grammar);
+        assert!(normed.contains_key("S"));
+        assert!(normed.keys().any(|k| k.starts_with("LR[")));
+        for (lhs, rhss) in &normed {
+            for rhs in rhss {
+                assert!(!rhs.is_empty(), "{lhs} has an empty production");
+                assert!(
+                    preterms.contains_key(&rhs[0]),
+                    "{lhs} -> {rhs:?} is not in GNF byte-preterminal shape"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_tokens_exercise_partial_and_invalid_suffixes() {
+        let eq = classify(
+            r#"root ::= "a" "b""#,
+            vec![
+                tok("a", 0),
+                tok("ab", 1),
+                tok("abc", 2),
+                tok("b", 3),
+                tok("c", 4),
+                tok("<eos>", 5),
+            ],
+            5,
+        );
+        assert_valid(&eq, 0);
+        assert_valid(&eq, 1);
+        assert_valid(&eq, 3);
+        assert_invalid(&eq, 2);
+        assert_invalid(&eq, 4);
+        assert_valid(&eq, 5);
+        assert_ne!(class_of(&eq, 5), class_of(&eq, 1));
+    }
+
+    #[test]
+    fn shared_prefix_keywords_keep_partial_tokens_distinct_from_full_tokens() {
+        let eq = classify(
+            r#"root ::= "true" | "false""#,
+            vec![
+                tok("t", 0),
+                tok("tr", 1),
+                tok("true", 2),
+                tok("f", 3),
+                tok("fa", 4),
+                tok("false", 5),
+                tok("x", 6),
+                tok("<eos>", 7),
+            ],
+            7,
+        );
+        for id in 0..=5 {
+            assert_valid(&eq, id);
+        }
+        assert_invalid(&eq, 6);
+        assert_ne!(class_of(&eq, 0), class_of(&eq, 2));
+        assert_ne!(class_of(&eq, 3), class_of(&eq, 5));
+    }
+
+    #[test]
+    fn nullable_branches_do_not_overaccept_impossible_tokens() {
+        let eq = classify(
+            r#"
+                root ::= sign? ws? digits
+                sign ::= "+" | "-"
+                ws ::= " "
+                digits ::= [0-9]+
+            "#,
+            vec![
+                tok("+", 0),
+                tok("-", 1),
+                tok(" ", 2),
+                tok("1", 3),
+                tok("+1", 4),
+                tok("- 2", 5),
+                tok("++", 6),
+                tok("a", 7),
+                tok("<eos>", 8),
+            ],
+            8,
+        );
+        for id in 0..=5 {
+            assert_valid(&eq, id);
+        }
+        assert_invalid(&eq, 6);
+        assert_invalid(&eq, 7);
+    }
+
+    #[test]
+    fn recursive_arithmetic_tokens_preserve_stack_contexts() {
+        let eq = classify(
+            r#"
+                root ::= expr
+                expr ::= term (("+" | "-") term)*
+                term ::= factor (("*" | "/") factor)*
+                factor ::= [0-9]+ | "(" expr ")"
+            "#,
+            vec![
+                tok("1", 0),
+                tok("12", 1),
+                tok("+", 2),
+                tok("+3", 3),
+                tok("(", 4),
+                tok("(1", 5),
+                tok(")", 6),
+                tok("*", 7),
+                tok("a", 8),
+                tok("<eos>", 9),
+            ],
+            9,
+        );
+        for id in 0..=7 {
+            assert_valid(&eq, id);
+        }
+        assert_invalid(&eq, 8);
+        assert_ne!(class_of(&eq, 0), class_of(&eq, 2));
+        assert_ne!(class_of(&eq, 4), class_of(&eq, 6));
+    }
+
+    #[test]
+    fn indirect_recursion_and_dead_rules_respect_stack_adjacency_and_reachability() {
+        let eq = classify(
+            r#"
+                root ::= a
+                a ::= b "x" | "a"
+                b ::= a "y" | "b"
+                dead ::= "z"
+            "#,
+            vec![
+                tok("a", 0),
+                tok("b", 1),
+                tok("x", 2),
+                tok("y", 3),
+                tok("ax", 4),
+                tok("by", 5),
+                tok("z", 6),
+                tok("<eos>", 7),
+            ],
+            7,
+        );
+        for id in 0..=3 {
+            assert_valid(&eq, id);
+        }
+        assert_invalid(&eq, 4);
+        assert_invalid(&eq, 5);
+        assert_invalid(&eq, 6);
+    }
+
+    #[test]
+    fn character_classes_cover_ranges_and_negation() {
+        let eq = classify(
+            r#"
+                root ::= word " " number " " not_newline
+                word ::= [a-z]+
+                number ::= [0-9]+
+                not_newline ::= [^\n]+
+            "#,
+            vec![
+                tok("abc", 0),
+                tok("9", 1),
+                tok(" ", 2),
+                tok("Z", 3),
+                tok("\n", 4),
+                tok("hello 42 ok", 5),
+                tok("<eos>", 6),
+                tok("A\n", 7),
+            ],
+            6,
+        );
+        assert_valid(&eq, 0);
+        assert_valid(&eq, 1);
+        assert_valid(&eq, 2);
+        assert_valid(&eq, 3);
+        assert_valid(&eq, 5);
+        assert_invalid(&eq, 4);
+        assert_invalid(&eq, 7);
+    }
+
+    #[test]
+    fn utf8_literals_and_split_bytes_are_classified() {
+        let lambda = "λ".as_bytes();
+        let e_acute = "é".as_bytes();
+        let eq = classify(
+            r#"root ::= "é" | "λ""#,
+            vec![
+                tok("é", 0),
+                tok("λ", 1),
+                tok_bytes(&lambda[..1], 2),
+                tok_bytes(&lambda[1..], 3),
+                tok_bytes(&e_acute[..1], 4),
+                tok("e", 5),
+                tok("<eos>", 6),
+            ],
+            6,
+        );
+        assert_valid(&eq, 0);
+        assert_valid(&eq, 1);
+        assert_valid(&eq, 2);
+        assert_valid(&eq, 3);
+        assert_valid(&eq, 4);
+        assert_invalid(&eq, 5);
+    }
+
+    #[test]
+    fn control_bytes_skip_options_and_ignored_ranges_are_honored() {
+        let mut args = test_args();
+        args.skip_null_bytes = true;
+        args.skip_repeat_bytes = true;
+        args.ignore_range = vec![(6, 7)];
+        let eq = classify_with_args(
+            r#"root ::= "a" | "\n" | "\t" | "\x00" | "***""#,
+            vec![
+                tok("a", 0),
+                tok("\n", 1),
+                tok("\t", 2),
+                tok_bytes(&[0], 3),
+                tok("***", 4),
+                tok("b", 5),
+                tok("ignored", 6),
+                tok("<eos>", 7),
+            ],
+            7,
+            args,
+        );
+        assert_valid(&eq, 0);
+        assert_valid(&eq, 1);
+        assert_valid(&eq, 2);
+        assert_valid(&eq, 3);
+        assert_valid(&eq, 4);
+        assert_invalid(&eq, 5);
+        assert_eq!(class_of(&eq, 6), -1);
+        assert!(!eq.invalid_tokens.contains(&6));
+        assert_ne!(class_of(&eq, 3), class_of(&eq, 4));
+    }
+
+    #[test]
+    fn duplicate_state_compression_groups_language_equivalent_tokens() {
+        let eq = classify(
+            r#"
+                root ::= left | right
+                left ::= "a" tail
+                right ::= "b" tail
+                tail ::= "!"
+            "#,
+            vec![
+                tok("a", 0),
+                tok("b", 1),
+                tok("!", 2),
+                tok("a!", 3),
+                tok("b!", 4),
+                tok("?", 5),
+                tok("<eos>", 6),
+            ],
+            6,
+        );
+        assert_valid(&eq, 0);
+        assert_valid(&eq, 1);
+        assert_valid(&eq, 2);
+        assert_valid(&eq, 3);
+        assert_valid(&eq, 4);
+        assert_invalid(&eq, 5);
+        assert_eq!(class_of(&eq, 0), class_of(&eq, 1));
+        assert_eq!(class_of(&eq, 3), class_of(&eq, 4));
+    }
+
+    #[test]
+    fn representatives_choose_shortest_token_in_class_and_eos_is_singleton() {
+        let eq = classify(
+            r#"root ::= [a-z]+"#,
+            vec![
+                tok("a", 0),
+                tok("b", 1),
+                tok("ab", 2),
+                tok("abc", 3),
+                tok("<eos>", 4),
+            ],
+            4,
+        );
+        for id in 0..=3 {
+            assert_valid(&eq, id);
+        }
+        assert_valid(&eq, 4);
+        assert_ne!(class_of(&eq, 4), class_of(&eq, 0));
+        let class = class_of(&eq, 0) as usize;
+        assert_eq!(eq.class_representatives[class], b"a");
+    }
+
+    #[test]
+    fn output_serialization_smoke_test_and_path_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("artifacts");
+        let eq = EquivOut {
+            token_classes: vec![0, -1, 1],
+            invalid_tokens: vec![1],
+            class_representatives: vec![b"a".to_vec(), b"<eos>".to_vec()],
+        };
+        write_output(&out_dir, &eq).unwrap();
+        assert!(out_dir.join("tc.pt").is_file());
+        assert!(out_dir.join("inv.pt").is_file());
+        assert!(out_dir.join("cr.pkl").is_file());
+        assert!(write_output(&out_dir, &eq).is_err());
+
+        let file_path = dir.path().join("already-a-file");
+        fs::write(&file_path, b"x").unwrap();
+        assert!(write_output(&file_path, &eq).is_err());
+    }
+
+    #[test]
+    fn token_trie_reuses_prefix_frontiers() {
+        let ig = IntGrammar {
+            preterms_rev: HashMap::from([(b'a', vec![1])]),
+            nt_map: HashMap::from([(1, vec![0])]),
+            transitions: HashMap::from([((1, 0), vec![Vec::new(), vec![0]])]),
+            stack_adj: HashMap::from([(0, HashSet::new())]),
+            start: 0,
+        };
+        let tasks = vec![(vec![b'a'], 10), (vec![b'a', b'a'], 11), (vec![b'b'], 12)];
+        let got = compute_stack_in_out_for_trie(&tasks, &ig, None)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        let one_a = HashSet::from([(vec![0], Vec::new()), (vec![0], vec![0])]);
+        let two_a = HashSet::from([(vec![0], Vec::new()), (vec![0], vec![0])]);
+        assert_eq!(got.get(&10), Some(&Some(one_a)));
+        assert_eq!(got.get(&11), Some(&Some(two_a)));
+        assert_eq!(got.get(&12), Some(&None));
     }
 }
