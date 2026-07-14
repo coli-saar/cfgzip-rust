@@ -1,3 +1,4 @@
+use ahash::RandomState as AHashRandomState;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
@@ -16,6 +17,16 @@ type Symbol = String;
 type Rhs = Vec<Symbol>;
 type Grammar = BTreeMap<Symbol, BTreeSet<Rhs>>;
 type Preterms = BTreeMap<Symbol, BTreeSet<u8>>;
+type FastHashMap<K, V> = HashMap<K, V, AHashRandomState>;
+type FastHashSet<T> = HashSet<T, AHashRandomState>;
+
+fn fast_hash_map<K, V>() -> FastHashMap<K, V> {
+    HashMap::with_hasher(AHashRandomState::new())
+}
+
+fn fast_hash_set<T>() -> FastHashSet<T> {
+    HashSet::with_hasher(AHashRandomState::new())
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "cfgzip-preprocess")]
@@ -1223,8 +1234,8 @@ struct EquivOut {
 struct IntGrammar {
     preterms_rev: [Vec<usize>; 256],
     nt_map: Vec<Vec<usize>>,
-    transitions: Vec<HashMap<usize, Vec<Vec<usize>>>>,
-    stack_adj: Vec<HashSet<Option<usize>>>,
+    transitions: Vec<FastHashMap<usize, Vec<Vec<usize>>>>,
+    stack_adj: Vec<FastHashSet<Option<usize>>>,
     start: usize,
 }
 
@@ -1239,18 +1250,18 @@ struct SearchState {
 #[derive(Clone)]
 struct StackInterner {
     stacks: Vec<Vec<usize>>,
-    ids: HashMap<Vec<usize>, usize>,
+    ids: FastHashMap<Vec<usize>, usize>,
 }
 
 #[derive(Default)]
 struct TokenTrieNode {
-    children: HashMap<u8, usize>,
+    children: BTreeMap<u8, usize>,
     token_ids: Vec<usize>,
 }
 
 struct TrieJob {
     node_id: usize,
-    frontier: HashSet<SearchState>,
+    frontier: FastHashSet<SearchState>,
     stacks: StackInterner,
 }
 
@@ -1272,7 +1283,7 @@ struct TokenTraversalResults {
 
 impl StackInterner {
     fn new() -> Self {
-        let mut ids = HashMap::new();
+        let mut ids = fast_hash_map();
         ids.insert(Vec::new(), 0);
         Self {
             stacks: vec![Vec::new()],
@@ -1324,9 +1335,9 @@ impl StackInterner {
 }
 
 fn rebase_frontier(
-    frontier: &HashSet<SearchState>,
+    frontier: &FastHashSet<SearchState>,
     stacks: &StackInterner,
-) -> (StackInterner, HashSet<SearchState>) {
+) -> (StackInterner, FastHashSet<SearchState>) {
     let mut rebased_stacks = StackInterner::new();
     let rebased_frontier = frontier
         .iter()
@@ -1340,7 +1351,10 @@ fn rebase_frontier(
     (rebased_stacks, rebased_frontier)
 }
 
-fn intern_global_stack(global_stacks: &mut HashMap<Vec<usize>, usize>, stack: &[usize]) -> usize {
+fn intern_global_stack(
+    global_stacks: &mut FastHashMap<Vec<usize>, usize>,
+    stack: &[usize],
+) -> usize {
     if let Some(&id) = global_stacks.get(stack) {
         return id;
     }
@@ -1352,9 +1366,9 @@ fn intern_global_stack(global_stacks: &mut HashMap<Vec<usize>, usize>, stack: &[
 fn compute_stack_adj(
     grammar: &HashMap<usize, Vec<Vec<usize>>>,
     start: usize,
-) -> HashMap<usize, HashSet<Option<usize>>> {
-    let mut all = grammar.keys().copied().collect::<HashSet<_>>();
-    let mut neigh: HashMap<usize, HashSet<usize>> = HashMap::new();
+) -> FastHashMap<usize, FastHashSet<Option<usize>>> {
+    let mut all = grammar.keys().copied().collect::<FastHashSet<_>>();
+    let mut neigh: FastHashMap<usize, FastHashSet<usize>> = fast_hash_map();
     for prods in grammar.values() {
         for beta in prods {
             all.extend(beta.iter().skip(1).copied());
@@ -1367,8 +1381,8 @@ fn compute_stack_adj(
     fn rec_adj(
         x: usize,
         grammar: &HashMap<usize, Vec<Vec<usize>>>,
-        visited: &mut HashSet<usize>,
-        out: &mut HashSet<usize>,
+        visited: &mut FastHashSet<usize>,
+        out: &mut FastHashSet<usize>,
     ) {
         visited.insert(x);
         if let Some(prods) = grammar.get(&x) {
@@ -1383,19 +1397,19 @@ fn compute_stack_adj(
             }
         }
     }
-    let mut adj = HashMap::new();
+    let mut adj = fast_hash_map();
     for a in all {
-        let mut s = HashSet::from([None]);
+        let mut s = [None].into_iter().collect::<FastHashSet<_>>();
         if let Some(bs) = neigh.get(&a) {
             for &b in bs {
-                let mut out = HashSet::new();
-                rec_adj(b, grammar, &mut HashSet::new(), &mut out);
+                let mut out = fast_hash_set();
+                rec_adj(b, grammar, &mut fast_hash_set(), &mut out);
                 s.extend(out.into_iter().map(Some));
             }
         }
         adj.insert(a, s);
     }
-    adj.insert(start, HashSet::new());
+    adj.insert(start, fast_hash_set());
     adj
 }
 
@@ -1433,10 +1447,10 @@ fn compute_subtree_token_counts(nodes: &[TokenTrieNode]) -> Vec<usize> {
     counts
 }
 
-fn initial_frontier(start: usize) -> (StackInterner, HashSet<SearchState>) {
+fn initial_frontier(start: usize) -> (StackInterner, FastHashSet<SearchState>) {
     let mut stacks = StackInterner::new();
     let start_stack = stacks.intern_slice(&[start]);
-    let frontier = HashSet::from([
+    let frontier = [
         SearchState {
             in_stack: 0,
             out_stack: 0,
@@ -1449,21 +1463,23 @@ fn initial_frontier(start: usize) -> (StackInterner, HashSet<SearchState>) {
             prev_symbol: None,
             allow_bt: false,
         },
-    ]);
+    ]
+    .into_iter()
+    .collect();
     (stacks, frontier)
 }
 
 fn advance_frontier(
-    frontier: &HashSet<SearchState>,
+    frontier: &FastHashSet<SearchState>,
     byte: u8,
     ig: &IntGrammar,
     stacks: &mut StackInterner,
-) -> HashSet<SearchState> {
+) -> FastHashSet<SearchState> {
     let pts = &ig.preterms_rev[byte as usize];
     if pts.is_empty() {
-        return HashSet::new();
+        return fast_hash_set();
     }
-    let mut next_states = HashSet::new();
+    let mut next_states = fast_hash_set();
     for state in frontier {
         if stacks.is_empty(state.out_stack) {
             if !state.allow_bt {
@@ -1509,11 +1525,11 @@ fn advance_frontier(
     next_states
 }
 
-fn frontier_stack_pairs(frontier: &HashSet<SearchState>) -> Option<Vec<(usize, usize)>> {
+fn frontier_stack_pairs(frontier: &FastHashSet<SearchState>) -> Option<Vec<(usize, usize)>> {
     let mut out = frontier
         .iter()
         .map(|s| (s.in_stack, s.out_stack))
-        .collect::<HashSet<_>>()
+        .collect::<FastHashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     out.sort_unstable();
@@ -1523,7 +1539,7 @@ fn frontier_stack_pairs(frontier: &HashSet<SearchState>) -> Option<Vec<(usize, u
 fn collect_token_trie_results(
     nodes: &[TokenTrieNode],
     node_id: usize,
-    frontier: &HashSet<SearchState>,
+    frontier: &FastHashSet<SearchState>,
     stacks: &mut StackInterner,
     ig: &IntGrammar,
     out: &mut Vec<LocalTokenResult>,
@@ -1540,9 +1556,7 @@ fn collect_token_trie_results(
             stack_pairs: stack_pairs.clone(),
         });
     }
-    let mut children = node.children.iter().collect::<Vec<_>>();
-    children.sort_unstable_by_key(|(b, _)| **b);
-    for (&byte, &child_id) in children {
+    for (&byte, &child_id) in &node.children {
         let next = advance_frontier(frontier, byte, ig, stacks);
         if !next.is_empty() {
             collect_token_trie_results(nodes, child_id, &next, stacks, ig, out);
@@ -1564,9 +1578,7 @@ fn collect_invalid_subtree(
             stack_pairs: None,
         });
     }
-    let mut children = node.children.iter().collect::<Vec<_>>();
-    children.sort_unstable_by_key(|(b, _)| **b);
-    for (_, &child_id) in children {
+    for &child_id in node.children.values() {
         collect_invalid_subtree(nodes, child_id, out);
     }
 }
@@ -1575,7 +1587,7 @@ fn collect_token_trie_jobs(
     nodes: &[TokenTrieNode],
     subtree_token_counts: &[usize],
     node_id: usize,
-    frontier: HashSet<SearchState>,
+    frontier: FastHashSet<SearchState>,
     stacks: &mut StackInterner,
     depth: usize,
     ig: &IntGrammar,
@@ -1604,9 +1616,7 @@ fn collect_token_trie_jobs(
         });
     }
 
-    let mut children = node.children.iter().collect::<Vec<_>>();
-    children.sort_unstable_by_key(|(b, _)| **b);
-    for (&byte, &child_id) in children {
+    for (&byte, &child_id) in &node.children {
         let next = advance_frontier(&frontier, byte, ig, stacks);
         if next.is_empty() {
             collect_invalid_subtree(nodes, child_id, immediate);
@@ -1642,9 +1652,7 @@ fn compute_stack_in_out_for_trie(
             stack_pairs: None,
         });
     }
-    let mut root_children = trie[0].children.iter().collect::<Vec<_>>();
-    root_children.sort_unstable_by_key(|(b, _)| **b);
-    for (&byte, &child_id) in root_children {
+    for (&byte, &child_id) in &trie[0].children {
         let frontier = advance_frontier(&root_frontier, byte, ig, &mut root_stacks);
         if frontier.is_empty() {
             collect_invalid_subtree(&trie, child_id, &mut immediate_results);
@@ -1755,7 +1763,8 @@ fn compute_token_classes(
         }
     }
     let mut nt_map = vec![Vec::new(); n_symbols];
-    let mut transitions = vec![HashMap::<usize, Vec<Vec<usize>>>::new(); n_symbols];
+    let mut transitions: Vec<FastHashMap<usize, Vec<Vec<usize>>>> =
+        (0..n_symbols).map(|_| fast_hash_map()).collect();
     for (a, prods) in &g_int {
         for beta in prods {
             if let Some((&b, rest)) = beta.split_first() {
@@ -1764,7 +1773,8 @@ fn compute_token_classes(
             }
         }
     }
-    let mut stack_adj_vec = vec![HashSet::new(); n_symbols];
+    let mut stack_adj_vec: Vec<FastHashSet<Option<usize>>> =
+        (0..n_symbols).map(|_| fast_hash_set()).collect();
     for (sym, adj) in stack_adj {
         if sym < stack_adj_vec.len() {
             stack_adj_vec[sym] = adj;
@@ -1828,9 +1838,9 @@ fn compute_token_classes(
     } else {
         None
     };
-    let mut global_stack_ids: HashMap<Vec<usize>, usize> = HashMap::new();
-    let mut seq_ids: HashMap<(usize, usize), usize> = HashMap::new();
-    let mut classes: HashMap<Vec<usize>, Vec<usize>> = HashMap::new();
+    let mut global_stack_ids: FastHashMap<Vec<usize>, usize> = fast_hash_map();
+    let mut seq_ids: FastHashMap<(usize, usize), usize> = fast_hash_map();
+    let mut classes: FastHashMap<Vec<usize>, Vec<usize>> = fast_hash_map();
     let mut invalid = Vec::new();
     for result in results.tokens {
         if let Some(stack_pairs) = result.stack_pairs {
@@ -2538,13 +2548,14 @@ mod tests {
     fn token_trie_reuses_prefix_frontiers() {
         let mut preterms_rev: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
         preterms_rev[b'a' as usize] = vec![1];
-        let mut transitions = vec![HashMap::<usize, Vec<Vec<usize>>>::new(); 2];
+        let mut transitions: Vec<FastHashMap<usize, Vec<Vec<usize>>>> =
+            (0..2).map(|_| fast_hash_map()).collect();
         transitions[1].insert(0, vec![Vec::new(), vec![0]]);
         let ig = IntGrammar {
             preterms_rev,
             nt_map: vec![Vec::new(), vec![0]],
             transitions,
-            stack_adj: vec![HashSet::new(), HashSet::new()],
+            stack_adj: (0..2).map(|_| fast_hash_set()).collect(),
             start: 0,
         };
         let tasks = vec![(vec![b'a'], 10), (vec![b'a', b'a'], 11), (vec![b'b'], 12)];
