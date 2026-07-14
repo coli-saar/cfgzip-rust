@@ -27,10 +27,6 @@ fn fast_hash_set<T>() -> FastHashSet<T> {
     HashSet::with_hasher(AHashRandomState::new())
 }
 
-fn fast_hash_set_with_capacity<T>(capacity: usize) -> FastHashSet<T> {
-    HashSet::with_capacity_and_hasher(capacity, AHashRandomState::new())
-}
-
 #[derive(Parser, Debug)]
 #[command(name = "cfgzip-preprocess")]
 #[command(about = "Standalone Rust preprocessor for CFGzip grammars")]
@@ -1262,13 +1258,15 @@ struct BacktrackTransition {
     outs: Vec<Vec<usize>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct SearchState {
     in_stack: usize,
     out_stack: usize,
     prev_symbol: Option<usize>,
     allow_bt: bool,
 }
+
+type Frontier = Vec<SearchState>;
 
 #[derive(Clone)]
 struct StackInterner {
@@ -1286,7 +1284,7 @@ struct TokenTrieNode {
 
 struct TrieJob {
     node_id: usize,
-    frontier: FastHashSet<SearchState>,
+    frontier: Frontier,
     stacks: StackInterner,
 }
 
@@ -1384,12 +1382,24 @@ impl StackInterner {
     }
 }
 
-fn rebase_frontier(
-    frontier: &FastHashSet<SearchState>,
-    stacks: &StackInterner,
-) -> (StackInterner, FastHashSet<SearchState>) {
+fn canonical_search_state(mut state: SearchState, stacks: &StackInterner) -> SearchState {
+    if !stacks.is_empty(state.out_stack) {
+        state.prev_symbol = None;
+    }
+    state
+}
+
+fn canonicalize_frontier(frontier: &mut Frontier, stacks: &StackInterner) {
+    for state in frontier.iter_mut() {
+        *state = canonical_search_state(*state, stacks);
+    }
+    frontier.sort_unstable();
+    frontier.dedup();
+}
+
+fn rebase_frontier(frontier: &[SearchState], stacks: &StackInterner) -> (StackInterner, Frontier) {
     let mut rebased_stacks = StackInterner::new();
-    let rebased_frontier = frontier
+    let mut rebased_frontier = frontier
         .iter()
         .map(|state| SearchState {
             in_stack: rebased_stacks.intern_slice(&stacks.stacks[state.in_stack]),
@@ -1397,7 +1407,8 @@ fn rebase_frontier(
             prev_symbol: state.prev_symbol,
             allow_bt: state.allow_bt,
         })
-        .collect();
+        .collect::<Frontier>();
+    canonicalize_frontier(&mut rebased_frontier, &rebased_stacks);
     (rebased_stacks, rebased_frontier)
 }
 
@@ -1540,10 +1551,10 @@ fn compute_subtree_token_counts(nodes: &[TokenTrieNode]) -> Vec<usize> {
     counts
 }
 
-fn initial_frontier(start: usize) -> (StackInterner, FastHashSet<SearchState>) {
+fn initial_frontier(start: usize) -> (StackInterner, Frontier) {
     let mut stacks = StackInterner::new();
     let start_stack = stacks.intern_slice(&[start]);
-    let frontier = [
+    let mut frontier = vec![
         SearchState {
             in_stack: 0,
             out_stack: 0,
@@ -1556,24 +1567,23 @@ fn initial_frontier(start: usize) -> (StackInterner, FastHashSet<SearchState>) {
             prev_symbol: None,
             allow_bt: false,
         },
-    ]
-    .into_iter()
-    .collect();
+    ];
+    canonicalize_frontier(&mut frontier, &stacks);
     (stacks, frontier)
 }
 
 fn advance_frontier(
-    frontier: &FastHashSet<SearchState>,
+    frontier: &[SearchState],
     byte: u8,
     ig: &IntGrammar,
     stacks: &mut StackInterner,
-) -> FastHashSet<SearchState> {
+) -> Frontier {
     let scan_by_head = &ig.scan_transitions[byte as usize];
     let backtrack_by_prev = &ig.backtrack_transitions[byte as usize];
     if scan_by_head.is_empty() && backtrack_by_prev.is_empty() {
-        return fast_hash_set();
+        return Vec::new();
     }
-    let mut next_states = fast_hash_set_with_capacity(frontier.len().saturating_mul(2));
+    let mut next_states = Vec::with_capacity(frontier.len().saturating_mul(2));
     for state in frontier {
         if stacks.is_empty(state.out_stack) {
             if !state.allow_bt {
@@ -1584,7 +1594,7 @@ fn advance_frontier(
                     let ins = stacks.push(state.in_stack, transition.start);
                     for t0_out in &transition.outs {
                         let out_stack = stacks.intern_slice(t0_out);
-                        next_states.insert(SearchState {
+                        next_states.push(SearchState {
                             in_stack: ins,
                             out_stack,
                             prev_symbol: Some(transition.start),
@@ -1598,7 +1608,7 @@ fn advance_frontier(
             if let Some(outs) = scan_by_head.get(&head) {
                 for t0_out in outs {
                     let new_out = stacks.prepend_to_tail(t0_out, state.out_stack, 1);
-                    next_states.insert(SearchState {
+                    next_states.push(SearchState {
                         in_stack: state.in_stack,
                         out_stack: new_out,
                         prev_symbol: Some(head),
@@ -1608,24 +1618,24 @@ fn advance_frontier(
             }
         }
     }
+    canonicalize_frontier(&mut next_states, stacks);
     next_states
 }
 
-fn frontier_stack_pairs(frontier: &FastHashSet<SearchState>) -> Option<Vec<(usize, usize)>> {
+fn frontier_stack_pairs(frontier: &[SearchState]) -> Option<Vec<(usize, usize)>> {
     let mut out = frontier
         .iter()
         .map(|s| (s.in_stack, s.out_stack))
-        .collect::<FastHashSet<_>>()
-        .into_iter()
         .collect::<Vec<_>>();
     out.sort_unstable();
+    out.dedup();
     (!out.is_empty()).then_some(out)
 }
 
 fn collect_token_trie_results(
     nodes: &[TokenTrieNode],
     node_id: usize,
-    frontier: &FastHashSet<SearchState>,
+    frontier: &[SearchState],
     stacks: &mut StackInterner,
     ig: &IntGrammar,
     out: &mut Vec<LocalTokenResult>,
@@ -1673,7 +1683,7 @@ fn collect_token_trie_jobs(
     nodes: &[TokenTrieNode],
     subtree_token_counts: &[usize],
     node_id: usize,
-    frontier: FastHashSet<SearchState>,
+    frontier: Frontier,
     stacks: &mut StackInterner,
     depth: usize,
     ig: &IntGrammar,
@@ -2231,16 +2241,16 @@ mod tests {
     }
 
     fn advance_frontier_reference(
-        frontier: &FastHashSet<SearchState>,
+        frontier: &[SearchState],
         byte: u8,
         raw: &RawIntGrammar,
         stacks: &mut StackInterner,
-    ) -> FastHashSet<SearchState> {
+    ) -> Frontier {
         let pts = &raw.preterms_rev[byte as usize];
         if pts.is_empty() {
-            return fast_hash_set();
+            return Vec::new();
         }
-        let mut next_states = fast_hash_set();
+        let mut next_states = Vec::new();
         for state in frontier {
             if stacks.is_empty(state.out_stack) {
                 if !state.allow_bt {
@@ -2254,7 +2264,7 @@ mod tests {
                                     for t0_out in outs {
                                         let ins = stacks.push(state.in_stack, s);
                                         let out_stack = stacks.intern_slice(t0_out);
-                                        next_states.insert(SearchState {
+                                        next_states.push(SearchState {
                                             in_stack: ins,
                                             out_stack,
                                             prev_symbol: Some(s),
@@ -2272,7 +2282,7 @@ mod tests {
                     if let Some(outs) = raw.transitions[pt].get(&head) {
                         for t0_out in outs {
                             let new_out = stacks.prepend_to_tail(t0_out, state.out_stack, 1);
-                            next_states.insert(SearchState {
+                            next_states.push(SearchState {
                                 in_stack: state.in_stack,
                                 out_stack: new_out,
                                 prev_symbol: Some(head),
@@ -2283,11 +2293,70 @@ mod tests {
                 }
             }
         }
+        canonicalize_frontier(&mut next_states, stacks);
+        next_states
+    }
+
+    fn advance_frontier_reference_without_dead_prev_canonicalization(
+        frontier: &[SearchState],
+        byte: u8,
+        raw: &RawIntGrammar,
+        stacks: &mut StackInterner,
+    ) -> Frontier {
+        let pts = &raw.preterms_rev[byte as usize];
+        if pts.is_empty() {
+            return Vec::new();
+        }
+        let mut next_states = Vec::new();
+        for state in frontier {
+            if stacks.is_empty(state.out_stack) {
+                if !state.allow_bt {
+                    continue;
+                }
+                for &pt in pts {
+                    if let Some(starts) = raw.nt_map.get(pt) {
+                        for &s in starts {
+                            if raw.stack_adj[s].contains(&state.prev_symbol) {
+                                if let Some(outs) = raw.transitions[pt].get(&s) {
+                                    for t0_out in outs {
+                                        let ins = stacks.push(state.in_stack, s);
+                                        let out_stack = stacks.intern_slice(t0_out);
+                                        next_states.push(SearchState {
+                                            in_stack: ins,
+                                            out_stack,
+                                            prev_symbol: Some(s),
+                                            allow_bt: state.allow_bt,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                let head = stacks.first(state.out_stack).unwrap();
+                for &pt in pts {
+                    if let Some(outs) = raw.transitions[pt].get(&head) {
+                        for t0_out in outs {
+                            let new_out = stacks.prepend_to_tail(t0_out, state.out_stack, 1);
+                            next_states.push(SearchState {
+                                in_stack: state.in_stack,
+                                out_stack: new_out,
+                                prev_symbol: Some(head),
+                                allow_bt: state.allow_bt,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        next_states.sort_unstable();
+        next_states.dedup();
         next_states
     }
 
     fn materialized_frontier(
-        frontier: &FastHashSet<SearchState>,
+        frontier: &[SearchState],
         stacks: &StackInterner,
     ) -> HashSet<(Vec<usize>, Vec<usize>, Option<usize>, bool)> {
         frontier
@@ -2915,6 +2984,124 @@ mod tests {
     }
 
     #[test]
+    fn frontier_canonicalization_drops_dead_prev_symbol_for_nonempty_out_stack() {
+        let mut stacks = StackInterner::new();
+        let out_stack = stacks.intern_slice(&[7, 8]);
+        let mut frontier = vec![
+            SearchState {
+                in_stack: 0,
+                out_stack,
+                prev_symbol: Some(1),
+                allow_bt: true,
+            },
+            SearchState {
+                in_stack: 0,
+                out_stack,
+                prev_symbol: Some(2),
+                allow_bt: true,
+            },
+        ];
+
+        canonicalize_frontier(&mut frontier, &stacks);
+
+        assert_eq!(
+            frontier,
+            vec![SearchState {
+                in_stack: 0,
+                out_stack,
+                prev_symbol: None,
+                allow_bt: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn frontier_canonicalization_preserves_prev_symbol_for_empty_out_stack() {
+        let stacks = StackInterner::new();
+        let mut frontier = vec![
+            SearchState {
+                in_stack: 0,
+                out_stack: 0,
+                prev_symbol: Some(1),
+                allow_bt: true,
+            },
+            SearchState {
+                in_stack: 0,
+                out_stack: 0,
+                prev_symbol: Some(2),
+                allow_bt: true,
+            },
+        ];
+
+        canonicalize_frontier(&mut frontier, &stacks);
+
+        assert_eq!(frontier.len(), 2);
+        assert_eq!(
+            frontier
+                .iter()
+                .map(|state| state.prev_symbol)
+                .collect::<HashSet<_>>(),
+            HashSet::from([Some(1), Some(2)])
+        );
+    }
+
+    #[test]
+    fn dead_prev_symbol_canonicalization_preserves_traversal_displacements() {
+        let tokens = vec![
+            tok("a", 0),
+            tok("ab", 1),
+            tok("abb", 2),
+            tok("ac", 3),
+            tok("b", 4),
+            tok("c", 5),
+        ];
+        let (raw, optimized) = test_int_grammars(
+            r#"
+                root ::= left | right
+                left ::= "a" mid "b" | "a" mid "c"
+                right ::= "b" mid "b" | "b" mid "c"
+                mid ::= tail | tail tail
+                tail ::= "b" | "c"
+            "#,
+            &tokens,
+        );
+        let optimized = materialized_token_results(&compute_stack_in_out_for_trie(
+            &tokens, &optimized, None,
+        ));
+        let uncanonicalized_reference = tokens
+            .iter()
+            .map(|(token, id)| {
+                let (mut stacks, mut frontier) = initial_frontier(0);
+                for &byte in token {
+                    frontier = advance_frontier_reference_without_dead_prev_canonicalization(
+                        &frontier,
+                        byte,
+                        &raw,
+                        &mut stacks,
+                    );
+                    if frontier.is_empty() {
+                        return (*id, None);
+                    }
+                }
+                let materialized = frontier_stack_pairs(&frontier).map(|pairs| {
+                    pairs
+                        .into_iter()
+                        .map(|(in_stack, out_stack)| {
+                            (
+                                stacks.stacks[in_stack].clone(),
+                                stacks.stacks[out_stack].clone(),
+                            )
+                        })
+                        .collect::<HashSet<_>>()
+                });
+                (*id, materialized)
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(optimized, uncanonicalized_reference);
+    }
+
+    #[test]
     fn trie_traversal_matches_reference_for_recursive_arithmetic() {
         assert_trie_matches_reference(
             r#"
@@ -3211,7 +3398,7 @@ mod tests {
             },
         ]
         .into_iter()
-        .collect::<FastHashSet<_>>();
+        .collect::<Frontier>();
 
         let reference =
             advance_frontier_reference(&frontier, b'x', &raw, &mut reference_stacks);
