@@ -27,6 +27,10 @@ fn fast_hash_set<T>() -> FastHashSet<T> {
     HashSet::with_hasher(AHashRandomState::new())
 }
 
+fn fast_hash_set_with_capacity<T>(capacity: usize) -> FastHashSet<T> {
+    HashSet::with_capacity_and_hasher(capacity, AHashRandomState::new())
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "cfgzip-preprocess")]
 #[command(about = "Standalone Rust preprocessor for CFGzip grammars")]
@@ -1247,11 +1251,15 @@ struct EquivOut {
 
 #[derive(Clone)]
 struct IntGrammar {
-    preterms_rev: [Vec<usize>; 256],
-    nt_map: Vec<Vec<usize>>,
-    transitions: Vec<FastHashMap<usize, Vec<Vec<usize>>>>,
-    stack_adj: Vec<FastHashSet<Option<usize>>>,
+    scan_transitions: [FastHashMap<usize, Vec<Vec<usize>>>; 256],
+    backtrack_transitions: [FastHashMap<Option<usize>, Vec<BacktrackTransition>>; 256],
     start: usize,
+}
+
+#[derive(Clone)]
+struct BacktrackTransition {
+    start: usize,
+    outs: Vec<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1455,6 +1463,49 @@ fn compute_stack_adj(
     adj
 }
 
+fn build_byte_transition_tables(
+    preterms_rev: &[Vec<usize>; 256],
+    transitions: &[FastHashMap<usize, Vec<Vec<usize>>>],
+    stack_adj: &[FastHashSet<Option<usize>>],
+) -> (
+    [FastHashMap<usize, Vec<Vec<usize>>>; 256],
+    [FastHashMap<Option<usize>, Vec<BacktrackTransition>>; 256],
+) {
+    let mut scan_transitions: [FastHashMap<usize, Vec<Vec<usize>>>; 256] =
+        std::array::from_fn(|_| fast_hash_map());
+    let mut backtrack_transitions: [FastHashMap<Option<usize>, Vec<BacktrackTransition>>; 256] =
+        std::array::from_fn(|_| fast_hash_map());
+
+    for byte in 0..=u8::MAX {
+        let byte_idx = byte as usize;
+        for &pt in &preterms_rev[byte_idx] {
+            let Some(pt_transitions) = transitions.get(pt) else {
+                continue;
+            };
+            for (&head, outs) in pt_transitions {
+                scan_transitions[byte_idx]
+                    .entry(head)
+                    .or_default()
+                    .extend(outs.iter().cloned());
+
+                if let Some(adj) = stack_adj.get(head) {
+                    for &prev in adj {
+                        backtrack_transitions[byte_idx]
+                            .entry(prev)
+                            .or_default()
+                            .push(BacktrackTransition {
+                                start: head,
+                                outs: outs.clone(),
+                            });
+                    }
+                }
+            }
+        }
+    }
+
+    (scan_transitions, backtrack_transitions)
+}
+
 fn build_token_trie(tasks: &[(Vec<u8>, usize)]) -> Vec<TokenTrieNode> {
     let mut nodes = vec![TokenTrieNode::default()];
     for (tok, id) in tasks {
@@ -1517,49 +1568,42 @@ fn advance_frontier(
     ig: &IntGrammar,
     stacks: &mut StackInterner,
 ) -> FastHashSet<SearchState> {
-    let pts = &ig.preterms_rev[byte as usize];
-    if pts.is_empty() {
+    let scan_by_head = &ig.scan_transitions[byte as usize];
+    let backtrack_by_prev = &ig.backtrack_transitions[byte as usize];
+    if scan_by_head.is_empty() && backtrack_by_prev.is_empty() {
         return fast_hash_set();
     }
-    let mut next_states = fast_hash_set();
+    let mut next_states = fast_hash_set_with_capacity(frontier.len().saturating_mul(2));
     for state in frontier {
         if stacks.is_empty(state.out_stack) {
             if !state.allow_bt {
                 continue;
             }
-            for &pt in pts {
-                if let Some(starts) = ig.nt_map.get(pt) {
-                    for &s in starts {
-                        if ig.stack_adj[s].contains(&state.prev_symbol) {
-                            if let Some(outs) = ig.transitions[pt].get(&s) {
-                                for t0_out in outs {
-                                    let ins = stacks.push(state.in_stack, s);
-                                    let out_stack = stacks.intern_slice(t0_out);
-                                    next_states.insert(SearchState {
-                                        in_stack: ins,
-                                        out_stack,
-                                        prev_symbol: Some(s),
-                                        allow_bt: state.allow_bt,
-                                    });
-                                }
-                            }
-                        }
+            if let Some(transitions) = backtrack_by_prev.get(&state.prev_symbol) {
+                for transition in transitions {
+                    let ins = stacks.push(state.in_stack, transition.start);
+                    for t0_out in &transition.outs {
+                        let out_stack = stacks.intern_slice(t0_out);
+                        next_states.insert(SearchState {
+                            in_stack: ins,
+                            out_stack,
+                            prev_symbol: Some(transition.start),
+                            allow_bt: state.allow_bt,
+                        });
                     }
                 }
             }
         } else {
             let head = stacks.first(state.out_stack).unwrap();
-            for &pt in pts {
-                if let Some(outs) = ig.transitions[pt].get(&head) {
-                    for t0_out in outs {
-                        let new_out = stacks.prepend_to_tail(t0_out, state.out_stack, 1);
-                        next_states.insert(SearchState {
-                            in_stack: state.in_stack,
-                            out_stack: new_out,
-                            prev_symbol: Some(head),
-                            allow_bt: state.allow_bt,
-                        });
-                    }
+            if let Some(outs) = scan_by_head.get(&head) {
+                for t0_out in outs {
+                    let new_out = stacks.prepend_to_tail(t0_out, state.out_stack, 1);
+                    next_states.insert(SearchState {
+                        in_stack: state.in_stack,
+                        out_stack: new_out,
+                        prev_symbol: Some(head),
+                        allow_bt: state.allow_bt,
+                    });
                 }
             }
         }
@@ -1804,14 +1848,12 @@ fn compute_token_classes(
             }
         }
     }
-    let mut nt_map = vec![Vec::new(); n_symbols];
     let mut transitions: Vec<FastHashMap<usize, Vec<Vec<usize>>>> =
         (0..n_symbols).map(|_| fast_hash_map()).collect();
     for (a, prods) in &g_int {
         for beta in prods {
             if let Some((&b, rest)) = beta.split_first() {
                 transitions[b].entry(*a).or_default().push(rest.to_vec());
-                nt_map[b].push(*a);
             }
         }
     }
@@ -1822,11 +1864,11 @@ fn compute_token_classes(
             stack_adj_vec[sym] = adj;
         }
     }
+    let (scan_transitions, backtrack_transitions) =
+        build_byte_transition_tables(&preterms_rev, &transitions, &stack_adj_vec);
     let ig = IntGrammar {
-        preterms_rev,
-        nt_map,
-        transitions,
-        stack_adj: stack_adj_vec,
+        scan_transitions,
+        backtrack_transitions,
         start: 0,
     };
 
@@ -1884,19 +1926,29 @@ fn compute_token_classes(
     let mut seq_ids: FastHashMap<(usize, usize), usize> = fast_hash_map();
     let mut classes: FastHashMap<Vec<usize>, Vec<usize>> = fast_hash_map();
     let mut invalid = Vec::new();
+    let local_global_stack_ids = results
+        .stack_sets
+        .iter()
+        .map(|stacks| {
+            stacks
+                .stacks
+                .iter()
+                .map(|stack| intern_global_stack(&mut global_stack_ids, stack))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     for result in results.tokens {
         if let Some(stack_pairs) = result.stack_pairs {
-            let stacks = &results.stack_sets[result.stack_set];
-            let mut disp = Vec::new();
+            let global_ids = &local_global_stack_ids[result.stack_set];
+            let mut disp = Vec::with_capacity(stack_pairs.len());
             for (in_stack, out_stack) in stack_pairs {
-                let seq = (
-                    intern_global_stack(&mut global_stack_ids, &stacks.stacks[in_stack]),
-                    intern_global_stack(&mut global_stack_ids, &stacks.stacks[out_stack]),
-                );
+                let seq = (global_ids[in_stack], global_ids[out_stack]);
                 let next_id = seq_ids.len();
                 disp.push(*seq_ids.entry(seq).or_insert(next_id));
             }
-            disp.sort_unstable();
+            if !disp.windows(2).all(|pair| pair[0] <= pair[1]) {
+                disp.sort_unstable();
+            }
             classes.entry(disp).or_default().push(result.token_id);
         } else {
             invalid.push(result.token_id as i32);
@@ -2168,6 +2220,227 @@ mod tests {
             eq.invalid_tokens.contains(&(id as i32)),
             "token {id} should be listed as invalid; invalid={:?}",
             eq.invalid_tokens
+        );
+    }
+
+    struct RawIntGrammar {
+        preterms_rev: [Vec<usize>; 256],
+        nt_map: Vec<Vec<usize>>,
+        transitions: Vec<FastHashMap<usize, Vec<Vec<usize>>>>,
+        stack_adj: Vec<FastHashSet<Option<usize>>>,
+    }
+
+    fn advance_frontier_reference(
+        frontier: &FastHashSet<SearchState>,
+        byte: u8,
+        raw: &RawIntGrammar,
+        stacks: &mut StackInterner,
+    ) -> FastHashSet<SearchState> {
+        let pts = &raw.preterms_rev[byte as usize];
+        if pts.is_empty() {
+            return fast_hash_set();
+        }
+        let mut next_states = fast_hash_set();
+        for state in frontier {
+            if stacks.is_empty(state.out_stack) {
+                if !state.allow_bt {
+                    continue;
+                }
+                for &pt in pts {
+                    if let Some(starts) = raw.nt_map.get(pt) {
+                        for &s in starts {
+                            if raw.stack_adj[s].contains(&state.prev_symbol) {
+                                if let Some(outs) = raw.transitions[pt].get(&s) {
+                                    for t0_out in outs {
+                                        let ins = stacks.push(state.in_stack, s);
+                                        let out_stack = stacks.intern_slice(t0_out);
+                                        next_states.insert(SearchState {
+                                            in_stack: ins,
+                                            out_stack,
+                                            prev_symbol: Some(s),
+                                            allow_bt: state.allow_bt,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                let head = stacks.first(state.out_stack).unwrap();
+                for &pt in pts {
+                    if let Some(outs) = raw.transitions[pt].get(&head) {
+                        for t0_out in outs {
+                            let new_out = stacks.prepend_to_tail(t0_out, state.out_stack, 1);
+                            next_states.insert(SearchState {
+                                in_stack: state.in_stack,
+                                out_stack: new_out,
+                                prev_symbol: Some(head),
+                                allow_bt: state.allow_bt,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        next_states
+    }
+
+    fn materialized_frontier(
+        frontier: &FastHashSet<SearchState>,
+        stacks: &StackInterner,
+    ) -> HashSet<(Vec<usize>, Vec<usize>, Option<usize>, bool)> {
+        frontier
+            .iter()
+            .map(|state| {
+                (
+                    stacks.stacks[state.in_stack].clone(),
+                    stacks.stacks[state.out_stack].clone(),
+                    state.prev_symbol,
+                    state.allow_bt,
+                )
+            })
+            .collect()
+    }
+
+    fn test_int_grammars(
+        grammar: &str,
+        tokens: &[(Vec<u8>, usize)],
+    ) -> (RawIntGrammar, IntGrammar) {
+        let (grammar, preterms) = normalized(grammar);
+        let mut all = BTreeSet::new();
+        all.extend(grammar.keys().cloned());
+        for prods in grammar.values() {
+            for rhs in prods {
+                all.extend(rhs.iter().cloned());
+            }
+        }
+        let mut symbols = BTreeMap::from([("S".to_string(), 0usize)]);
+        for s in all.into_iter().filter(|s| s != "S") {
+            let id = symbols.len();
+            symbols.insert(s, id);
+        }
+        let n_symbols = symbols.len();
+        let mut g_int: HashMap<usize, Vec<Vec<usize>>> = HashMap::new();
+        for (a, prods) in &grammar {
+            let aid = symbols[a];
+            for beta in prods {
+                g_int
+                    .entry(aid)
+                    .or_default()
+                    .push(beta.iter().map(|b| symbols[b]).collect());
+            }
+        }
+
+        let stack_adj = compute_stack_adj(&g_int, 0);
+        let token_chars: HashSet<u8> = tokens.iter().flat_map(|(t, _)| t.iter().copied()).collect();
+        let mut preterms_rev: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
+        for (k, bytes) in &preterms {
+            let Some(&kid) = symbols.get(k) else {
+                continue;
+            };
+            for &b in bytes {
+                if token_chars.contains(&b) {
+                    preterms_rev[b as usize].push(kid);
+                }
+            }
+        }
+
+        let mut nt_map = vec![Vec::new(); n_symbols];
+        let mut transitions: Vec<FastHashMap<usize, Vec<Vec<usize>>>> =
+            (0..n_symbols).map(|_| fast_hash_map()).collect();
+        for (a, prods) in &g_int {
+            for beta in prods {
+                if let Some((&b, rest)) = beta.split_first() {
+                    transitions[b].entry(*a).or_default().push(rest.to_vec());
+                    nt_map[b].push(*a);
+                }
+            }
+        }
+        let mut stack_adj_vec: Vec<FastHashSet<Option<usize>>> =
+            (0..n_symbols).map(|_| fast_hash_set()).collect();
+        for (sym, adj) in stack_adj {
+            if sym < stack_adj_vec.len() {
+                stack_adj_vec[sym] = adj;
+            }
+        }
+
+        let (scan_transitions, backtrack_transitions) =
+            build_byte_transition_tables(&preterms_rev, &transitions, &stack_adj_vec);
+        let raw = RawIntGrammar {
+            preterms_rev,
+            nt_map,
+            transitions,
+            stack_adj: stack_adj_vec,
+        };
+        let optimized = IntGrammar {
+            scan_transitions,
+            backtrack_transitions,
+            start: 0,
+        };
+        (raw, optimized)
+    }
+
+    fn materialized_token_results(
+        traversal: &TokenTraversalResults,
+    ) -> HashMap<usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>> {
+        traversal
+            .tokens
+            .iter()
+            .map(|result| {
+                let stacks = &traversal.stack_sets[result.stack_set];
+                let materialized = result.stack_pairs.as_ref().map(|pairs| {
+                    pairs
+                        .iter()
+                        .map(|(in_stack, out_stack)| {
+                            (
+                                stacks.stacks[*in_stack].clone(),
+                                stacks.stacks[*out_stack].clone(),
+                            )
+                        })
+                        .collect::<HashSet<_>>()
+                });
+                (result.token_id, materialized)
+            })
+            .collect()
+    }
+
+    fn reference_token_results(
+        tokens: &[(Vec<u8>, usize)],
+        raw: &RawIntGrammar,
+    ) -> HashMap<usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>> {
+        tokens
+            .iter()
+            .map(|(token, id)| {
+                let (mut stacks, mut frontier) = initial_frontier(0);
+                for &byte in token {
+                    frontier = advance_frontier_reference(&frontier, byte, raw, &mut stacks);
+                    if frontier.is_empty() {
+                        return (*id, None);
+                    }
+                }
+                let materialized = frontier_stack_pairs(&frontier).map(|pairs| {
+                    pairs
+                        .into_iter()
+                        .map(|(in_stack, out_stack)| {
+                            (
+                                stacks.stacks[in_stack].clone(),
+                                stacks.stacks[out_stack].clone(),
+                            )
+                        })
+                        .collect::<HashSet<_>>()
+                });
+                (*id, materialized)
+            })
+            .collect()
+    }
+
+    fn assert_trie_matches_reference(grammar: &str, tokens: Vec<(Vec<u8>, usize)>) {
+        let (raw, optimized) = test_int_grammars(grammar, &tokens);
+        let optimized = compute_stack_in_out_for_trie(&tokens, &optimized, None);
+        assert_eq!(
+            materialized_token_results(&optimized),
+            reference_token_results(&tokens, &raw)
         );
     }
 
@@ -2587,17 +2860,422 @@ mod tests {
     }
 
     #[test]
+    fn token_trie_counts_duplicate_tokens_and_subtrees() {
+        fn descend(nodes: &[TokenTrieNode], bytes: &[u8]) -> usize {
+            let mut node = 0;
+            for &byte in bytes {
+                node = nodes[node].children[&byte];
+            }
+            node
+        }
+
+        let tasks = vec![
+            tok("a", 10),
+            tok("ab", 11),
+            tok("ab", 12),
+            tok("abc", 13),
+            tok("b", 14),
+            tok("ba", 15),
+        ];
+        let trie = build_token_trie(&tasks);
+        let counts = compute_subtree_token_counts(&trie);
+
+        assert_eq!(counts[0], 6);
+        assert_eq!(counts[descend(&trie, b"a")], 4);
+        assert_eq!(counts[descend(&trie, b"ab")], 3);
+        assert_eq!(trie[descend(&trie, b"ab")].token_ids, vec![11, 12]);
+
+        let mut invalid = Vec::new();
+        collect_invalid_subtree(&trie, descend(&trie, b"a"), &mut invalid);
+        invalid.sort_unstable_by_key(|result| result.token_id);
+        assert_eq!(
+            invalid
+                .into_iter()
+                .map(|result| (result.token_id, result.stack_pairs))
+                .collect::<Vec<_>>(),
+            vec![(10, None), (11, None), (12, None), (13, None)]
+        );
+    }
+
+    #[test]
+    fn stack_interner_reuses_push_prepend_and_slice_ids() {
+        let mut stacks = StackInterner::new();
+        let base = stacks.intern_slice(&[1, 2]);
+        assert_eq!(base, stacks.intern_slice(&[1, 2]));
+
+        let pushed = stacks.push(base, 3);
+        assert_eq!(pushed, stacks.push(base, 3));
+        assert_eq!(stacks.stacks[pushed], vec![1, 2, 3]);
+
+        let prepended = stacks.prepend_to_tail(&[9, 8], pushed, 1);
+        assert_eq!(prepended, stacks.prepend_to_tail(&[9, 8], pushed, 1));
+        assert_eq!(stacks.stacks[prepended], vec![9, 8, 2, 3]);
+        assert_eq!(stacks.prepend_to_tail(&[], pushed, 0), pushed);
+        assert_eq!(stacks.prepend_to_tail(&[], pushed, 3), 0);
+    }
+
+    #[test]
+    fn trie_traversal_matches_reference_for_recursive_arithmetic() {
+        assert_trie_matches_reference(
+            r#"
+                root ::= expr
+                expr ::= term (("+" | "-") term)*
+                term ::= factor (("*" | "/") factor)*
+                factor ::= [0-9]+ | "(" expr ")"
+            "#,
+            vec![
+                tok("1", 0),
+                tok("12", 1),
+                tok("+", 2),
+                tok("+3", 3),
+                tok("(", 4),
+                tok("(1", 5),
+                tok(")", 6),
+                tok("*", 7),
+                tok("a", 8),
+                tok("1+2", 9),
+                tok("(1+2", 10),
+                tok("(1+2)", 11),
+            ],
+        );
+    }
+
+    #[test]
+    fn trie_traversal_matches_reference_for_nullable_regex_grammar() {
+        assert_trie_matches_reference(
+            r#"
+                root ::= prefix? item ("," item)* suffix?
+                prefix ::= "[" | "("
+                suffix ::= "]" | ")"
+                item ::= [a-z]+ | [0-9]+
+            "#,
+            vec![
+                tok("[", 0),
+                tok("(", 1),
+                tok("a", 2),
+                tok("abc", 3),
+                tok("1", 4),
+                tok("12", 5),
+                tok(",", 6),
+                tok(",a", 7),
+                tok("]", 8),
+                tok(")", 9),
+                tok("[a,12]", 10),
+                tok("[,", 11),
+                tok("!", 12),
+            ],
+        );
+    }
+
+    #[test]
+    fn trie_traversal_matches_reference_for_utf8_split_bytes() {
+        let lambda = "λ".as_bytes();
+        let snow = "☃".as_bytes();
+        assert_trie_matches_reference(
+            r#"root ::= "λ" | "☃" | "λ☃""#,
+            vec![
+                tok("λ", 0),
+                tok("☃", 1),
+                tok("λ☃", 2),
+                tok_bytes(&lambda[..1], 3),
+                tok_bytes(&lambda[1..], 4),
+                tok_bytes(&snow[..1], 5),
+                tok_bytes(&snow[1..], 6),
+                tok("x", 7),
+            ],
+        );
+    }
+
+    #[test]
+    fn trie_traversal_is_token_order_invariant() {
+        let grammar = r#"
+            root ::= ("a" tail) | ("b" tail) | "c"
+            tail ::= "x" | "xy" | "xz"
+        "#;
+        let tokens = vec![
+            tok("a", 0),
+            tok("ax", 1),
+            tok("axy", 2),
+            tok("axz", 3),
+            tok("b", 4),
+            tok("bx", 5),
+            tok("bxy", 6),
+            tok("c", 7),
+            tok("q", 8),
+        ];
+        let mut reversed = tokens.clone();
+        reversed.reverse();
+
+        let (_, ig) = test_int_grammars(grammar, &tokens);
+        let first = materialized_token_results(&compute_stack_in_out_for_trie(&tokens, &ig, None));
+        let (_, ig) = test_int_grammars(grammar, &reversed);
+        let second =
+            materialized_token_results(&compute_stack_in_out_for_trie(&reversed, &ig, None));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn grammar_preprocessor_classification_is_token_order_invariant() {
+        let grammar = r#"
+            root ::= pair ("," pair)*
+            pair ::= key ":" value
+            key ::= [a-z]+
+            value ::= [0-9]+ | "true" | "false"
+        "#;
+        let tokens = vec![
+            tok("a", 0),
+            tok("abc", 1),
+            tok(":", 2),
+            tok("1", 3),
+            tok("123", 4),
+            tok(",", 5),
+            tok(",a", 6),
+            tok("true", 7),
+            tok("false", 8),
+            tok("?", 9),
+            tok("<eos>", 10),
+        ];
+        let mut shuffled = vec![
+            tokens[7].clone(),
+            tokens[0].clone(),
+            tokens[10].clone(),
+            tokens[4].clone(),
+            tokens[2].clone(),
+            tokens[8].clone(),
+            tokens[1].clone(),
+            tokens[9].clone(),
+            tokens[5].clone(),
+            tokens[3].clone(),
+            tokens[6].clone(),
+        ];
+
+        let first = classify(grammar, tokens, 10);
+        let second = classify(grammar, std::mem::take(&mut shuffled), 10);
+        assert_eq!(first.token_classes, second.token_classes);
+        assert_eq!(first.invalid_tokens, second.invalid_tokens);
+        assert_eq!(first.class_representatives, second.class_representatives);
+    }
+
+    #[test]
+    fn json_like_grammar_accepts_prefixes_and_rejects_bad_bytes() {
+        let eq = classify(
+            r#"
+                root ::= value
+                value ::= object | array | string | number | "true" | "false" | "null"
+                object ::= "{" pair ("," pair)* "}"
+                pair ::= string ":" value
+                array ::= "[" value ("," value)* "]"
+                string ::= "\"" chars "\""
+                chars ::= [a-zA-Z0-9_ ]*
+                number ::= "-"? [0-9]+
+            "#,
+            vec![
+                tok("{", 0),
+                tok("{\"", 1),
+                tok("\"", 2),
+                tok("\"a", 3),
+                tok("\"a\"", 4),
+                tok(":", 5),
+                tok("[", 6),
+                tok("]", 7),
+                tok("true", 8),
+                tok("false", 9),
+                tok("null", 10),
+                tok("-12", 11),
+                tok("@", 12),
+                tok("{@}", 13),
+                tok("<eos>", 14),
+            ],
+            14,
+        );
+        for id in 0..=11 {
+            assert_valid(&eq, id);
+        }
+        assert_invalid(&eq, 12);
+        assert_invalid(&eq, 13);
+    }
+
+    #[test]
+    fn precomputed_byte_transitions_match_reference_frontier_steps() {
+        let mut preterms_rev: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
+        preterms_rev[b'a' as usize] = vec![1, 2];
+        preterms_rev[b'b' as usize] = vec![2];
+        preterms_rev[b'c' as usize] = vec![1, 3];
+
+        let mut transitions: Vec<FastHashMap<usize, Vec<Vec<usize>>>> =
+            (0..6).map(|_| fast_hash_map()).collect();
+        transitions[1].insert(0, vec![vec![3, 4], vec![4]]);
+        transitions[1].insert(3, vec![Vec::new(), vec![5]]);
+        transitions[2].insert(0, vec![vec![5]]);
+        transitions[2].insert(4, vec![vec![3]]);
+        transitions[3].insert(5, vec![Vec::new()]);
+
+        let mut nt_map = vec![Vec::new(); 6];
+        for (pt, by_head) in transitions.iter().enumerate() {
+            nt_map[pt].extend(by_head.keys().copied());
+        }
+
+        let mut stack_adj: Vec<FastHashSet<Option<usize>>> =
+            (0..6).map(|_| fast_hash_set()).collect();
+        stack_adj[0].insert(None);
+        stack_adj[0].insert(Some(3));
+        stack_adj[3].insert(Some(0));
+        stack_adj[4].insert(Some(0));
+        stack_adj[5].insert(Some(4));
+
+        let raw = RawIntGrammar {
+            preterms_rev,
+            nt_map,
+            transitions,
+            stack_adj,
+        };
+        let (scan_transitions, backtrack_transitions) =
+            build_byte_transition_tables(&raw.preterms_rev, &raw.transitions, &raw.stack_adj);
+        let optimized = IntGrammar {
+            scan_transitions,
+            backtrack_transitions,
+            start: 0,
+        };
+
+        let (mut reference_stacks, mut reference_frontier) = initial_frontier(optimized.start);
+        let (mut optimized_stacks, mut optimized_frontier) = initial_frontier(optimized.start);
+        for &byte in b"aabc" {
+            reference_frontier = advance_frontier_reference(
+                &reference_frontier,
+                byte,
+                &raw,
+                &mut reference_stacks,
+            );
+            optimized_frontier =
+                advance_frontier(&optimized_frontier, byte, &optimized, &mut optimized_stacks);
+            assert_eq!(
+                materialized_frontier(&optimized_frontier, &optimized_stacks),
+                materialized_frontier(&reference_frontier, &reference_stacks),
+                "frontier mismatch after byte {byte:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn precomputed_backtracking_respects_previous_symbol_adjacency() {
+        let mut preterms_rev: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
+        preterms_rev[b'x' as usize] = vec![1];
+
+        let mut transitions: Vec<FastHashMap<usize, Vec<Vec<usize>>>> =
+            (0..4).map(|_| fast_hash_map()).collect();
+        transitions[1].insert(2, vec![Vec::new()]);
+        transitions[1].insert(3, vec![Vec::new()]);
+
+        let mut nt_map = vec![Vec::new(); 4];
+        nt_map[1] = vec![2, 3];
+
+        let mut stack_adj: Vec<FastHashSet<Option<usize>>> =
+            (0..4).map(|_| fast_hash_set()).collect();
+        stack_adj[2].insert(Some(7));
+        stack_adj[3].insert(Some(8));
+
+        let raw = RawIntGrammar {
+            preterms_rev,
+            nt_map,
+            transitions,
+            stack_adj,
+        };
+        let (scan_transitions, backtrack_transitions) =
+            build_byte_transition_tables(&raw.preterms_rev, &raw.transitions, &raw.stack_adj);
+        let optimized = IntGrammar {
+            scan_transitions,
+            backtrack_transitions,
+            start: 0,
+        };
+
+        let mut reference_stacks = StackInterner::new();
+        let mut optimized_stacks = StackInterner::new();
+        let frontier = [
+            SearchState {
+                in_stack: 0,
+                out_stack: 0,
+                prev_symbol: Some(7),
+                allow_bt: true,
+            },
+            SearchState {
+                in_stack: 0,
+                out_stack: 0,
+                prev_symbol: Some(8),
+                allow_bt: true,
+            },
+            SearchState {
+                in_stack: 0,
+                out_stack: 0,
+                prev_symbol: Some(9),
+                allow_bt: true,
+            },
+        ]
+        .into_iter()
+        .collect::<FastHashSet<_>>();
+
+        let reference =
+            advance_frontier_reference(&frontier, b'x', &raw, &mut reference_stacks);
+        let got = advance_frontier(&frontier, b'x', &optimized, &mut optimized_stacks);
+        assert_eq!(
+            materialized_frontier(&got, &optimized_stacks),
+            materialized_frontier(&reference, &reference_stacks)
+        );
+        assert_eq!(
+            materialized_frontier(&got, &optimized_stacks)
+                .into_iter()
+                .map(|(_, _, prev, _)| prev)
+                .collect::<HashSet<_>>(),
+            HashSet::from([Some(2), Some(3)])
+        );
+    }
+
+    #[test]
+    fn overlapping_preterminals_and_shared_prefixes_remain_distinct() {
+        let eq = classify(
+            r#"
+                root ::= ("a" tail) | ("a" alt) | ("b" tail)
+                tail ::= "x" | "xy"
+                alt ::= "y" "z"
+            "#,
+            vec![
+                tok("a", 0),
+                tok("ax", 1),
+                tok("axy", 2),
+                tok("ay", 3),
+                tok("ayz", 4),
+                tok("b", 5),
+                tok("bx", 6),
+                tok("bxy", 7),
+                tok("az", 8),
+                tok("byz", 9),
+                tok("<eos>", 10),
+            ],
+            10,
+        );
+        for id in 0..=7 {
+            assert_valid(&eq, id);
+        }
+        assert_invalid(&eq, 8);
+        assert_invalid(&eq, 9);
+        assert_ne!(class_of(&eq, 1), class_of(&eq, 3));
+        assert_eq!(class_of(&eq, 1), class_of(&eq, 6));
+        assert_eq!(class_of(&eq, 2), class_of(&eq, 7));
+    }
+
+    #[test]
     fn token_trie_reuses_prefix_frontiers() {
         let mut preterms_rev: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
         preterms_rev[b'a' as usize] = vec![1];
         let mut transitions: Vec<FastHashMap<usize, Vec<Vec<usize>>>> =
             (0..2).map(|_| fast_hash_map()).collect();
         transitions[1].insert(0, vec![Vec::new(), vec![0]]);
+        let stack_adj: Vec<FastHashSet<Option<usize>>> =
+            (0..2).map(|_| fast_hash_set()).collect();
+        let (scan_transitions, backtrack_transitions) =
+            build_byte_transition_tables(&preterms_rev, &transitions, &stack_adj);
         let ig = IntGrammar {
-            preterms_rev,
-            nt_map: vec![Vec::new(), vec![0]],
-            transitions,
-            stack_adj: (0..2).map(|_| fast_hash_set()).collect(),
+            scan_transitions,
+            backtrack_transitions,
             start: 0,
         };
         let tasks = vec![(vec![b'a'], 10), (vec![b'a', b'a'], 11), (vec![b'b'], 12)];
