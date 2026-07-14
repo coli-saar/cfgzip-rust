@@ -1254,6 +1254,22 @@ struct TrieJob {
     stacks: StackInterner,
 }
 
+struct LocalTokenResult {
+    token_id: usize,
+    stack_pairs: Option<Vec<(usize, usize)>>,
+}
+
+struct TokenStackResult {
+    token_id: usize,
+    stack_set: usize,
+    stack_pairs: Option<Vec<(usize, usize)>>,
+}
+
+struct TokenTraversalResults {
+    stack_sets: Vec<StackInterner>,
+    tokens: Vec<TokenStackResult>,
+}
+
 impl StackInterner {
     fn new() -> Self {
         let mut ids = HashMap::new();
@@ -1305,10 +1321,6 @@ impl StackInterner {
     fn is_empty(&self, stack_id: usize) -> bool {
         self.stacks[stack_id].is_empty()
     }
-
-    fn materialize(&self, stack_id: usize) -> Vec<usize> {
-        self.stacks[stack_id].clone()
-    }
 }
 
 fn rebase_frontier(
@@ -1326,6 +1338,15 @@ fn rebase_frontier(
         })
         .collect();
     (rebased_stacks, rebased_frontier)
+}
+
+fn intern_global_stack(global_stacks: &mut HashMap<Vec<usize>, usize>, stack: &[usize]) -> usize {
+    if let Some(&id) = global_stacks.get(stack) {
+        return id;
+    }
+    let id = global_stacks.len();
+    global_stacks.insert(stack.to_vec(), id);
+    id
 }
 
 fn compute_stack_adj(
@@ -1488,19 +1509,14 @@ fn advance_frontier(
     next_states
 }
 
-fn frontier_stack_in_out(
-    frontier: &HashSet<SearchState>,
-    stacks: &StackInterner,
-) -> Option<HashSet<(Vec<usize>, Vec<usize>)>> {
-    let out = frontier
+fn frontier_stack_pairs(frontier: &HashSet<SearchState>) -> Option<Vec<(usize, usize)>> {
+    let mut out = frontier
         .iter()
-        .map(|s| {
-            (
-                stacks.materialize(s.in_stack),
-                stacks.materialize(s.out_stack),
-            )
-        })
-        .collect::<HashSet<_>>();
+        .map(|s| (s.in_stack, s.out_stack))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    out.sort_unstable();
     (!out.is_empty()).then_some(out)
 }
 
@@ -1510,16 +1526,19 @@ fn collect_token_trie_results(
     frontier: &HashSet<SearchState>,
     stacks: &mut StackInterner,
     ig: &IntGrammar,
-    out: &mut Vec<(usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>)>,
+    out: &mut Vec<LocalTokenResult>,
 ) {
     let node = &nodes[node_id];
-    let stackio = if node.token_ids.is_empty() {
+    let stack_pairs = if node.token_ids.is_empty() {
         None
     } else {
-        frontier_stack_in_out(frontier, stacks)
+        frontier_stack_pairs(frontier)
     };
     for &id in &node.token_ids {
-        out.push((id, stackio.clone()));
+        out.push(LocalTokenResult {
+            token_id: id,
+            stack_pairs: stack_pairs.clone(),
+        });
     }
     let mut children = node.children.iter().collect::<Vec<_>>();
     children.sort_unstable_by_key(|(b, _)| **b);
@@ -1536,11 +1555,14 @@ fn collect_token_trie_results(
 fn collect_invalid_subtree(
     nodes: &[TokenTrieNode],
     node_id: usize,
-    out: &mut Vec<(usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>)>,
+    out: &mut Vec<LocalTokenResult>,
 ) {
     let node = &nodes[node_id];
     for &id in &node.token_ids {
-        out.push((id, None));
+        out.push(LocalTokenResult {
+            token_id: id,
+            stack_pairs: None,
+        });
     }
     let mut children = node.children.iter().collect::<Vec<_>>();
     children.sort_unstable_by_key(|(b, _)| **b);
@@ -1557,7 +1579,7 @@ fn collect_token_trie_jobs(
     stacks: &mut StackInterner,
     depth: usize,
     ig: &IntGrammar,
-    immediate: &mut Vec<(usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>)>,
+    immediate: &mut Vec<LocalTokenResult>,
     jobs: &mut Vec<TrieJob>,
 ) {
     const MAX_JOB_TOKENS: usize = 512;
@@ -1574,9 +1596,12 @@ fn collect_token_trie_jobs(
     }
 
     let node = &nodes[node_id];
-    let stackio = frontier_stack_in_out(&frontier, stacks);
+    let stack_pairs = frontier_stack_pairs(&frontier);
     for &id in &node.token_ids {
-        immediate.push((id, stackio.clone()));
+        immediate.push(LocalTokenResult {
+            token_id: id,
+            stack_pairs: stack_pairs.clone(),
+        });
     }
 
     let mut children = node.children.iter().collect::<Vec<_>>();
@@ -1605,14 +1630,17 @@ fn compute_stack_in_out_for_trie(
     tasks: &[(Vec<u8>, usize)],
     ig: &IntGrammar,
     pb: Option<&ProgressBar>,
-) -> Vec<(usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>)> {
+) -> TokenTraversalResults {
     let trie = build_token_trie(tasks);
     let subtree_token_counts = compute_subtree_token_counts(&trie);
     let (mut root_stacks, root_frontier) = initial_frontier(ig.start);
     let mut immediate_results = Vec::new();
     let mut jobs = Vec::new();
     for &id in &trie[0].token_ids {
-        immediate_results.push((id, None));
+        immediate_results.push(LocalTokenResult {
+            token_id: id,
+            stack_pairs: None,
+        });
     }
     let mut root_children = trie[0].children.iter().collect::<Vec<_>>();
     root_children.sort_unstable_by_key(|(b, _)| **b);
@@ -1653,15 +1681,33 @@ fn compute_stack_in_out_for_trie(
             if let Some(pb) = pb {
                 pb.inc(out.len() as u64);
             }
-            out
+            (job.stacks, out)
         })
         .collect::<Vec<_>>();
-    let mut results = immediate_results;
-    for mut job in job_results {
-        results.append(&mut job);
+
+    let mut stack_sets = vec![root_stacks];
+    let mut results = immediate_results
+        .into_iter()
+        .map(|result| TokenStackResult {
+            token_id: result.token_id,
+            stack_set: 0,
+            stack_pairs: result.stack_pairs,
+        })
+        .collect::<Vec<_>>();
+    for (stacks, job) in job_results {
+        let stack_set = stack_sets.len();
+        stack_sets.push(stacks);
+        results.extend(job.into_iter().map(|result| TokenStackResult {
+            token_id: result.token_id,
+            stack_set,
+            stack_pairs: result.stack_pairs,
+        }));
     }
-    results.sort_unstable_by_key(|(id, _)| *id);
-    results
+    results.sort_unstable_by_key(|result| result.token_id);
+    TokenTraversalResults {
+        stack_sets,
+        tokens: results,
+    }
 }
 
 fn compute_token_classes(
@@ -1774,7 +1820,7 @@ fn compute_token_classes(
     }
 
     let bucket_pb = if !args.no_progress {
-        let pb = ProgressBar::new(results.len() as u64);
+        let pb = ProgressBar::new(results.tokens.len() as u64);
         pb.set_style(progress_style(
             "bucketing classes [{elapsed_precise}] {wide_bar} {pos}/{len} ({per_sec}, eta {eta})",
         ));
@@ -1782,20 +1828,26 @@ fn compute_token_classes(
     } else {
         None
     };
-    let mut seq_ids: HashMap<(Vec<usize>, Vec<usize>), usize> = HashMap::new();
+    let mut global_stack_ids: HashMap<Vec<usize>, usize> = HashMap::new();
+    let mut seq_ids: HashMap<(usize, usize), usize> = HashMap::new();
     let mut classes: HashMap<Vec<usize>, Vec<usize>> = HashMap::new();
     let mut invalid = Vec::new();
-    for (id, stackio) in results {
-        if let Some(stackio) = stackio {
+    for result in results.tokens {
+        if let Some(stack_pairs) = result.stack_pairs {
+            let stacks = &results.stack_sets[result.stack_set];
             let mut disp = Vec::new();
-            for seq in stackio {
+            for (in_stack, out_stack) in stack_pairs {
+                let seq = (
+                    intern_global_stack(&mut global_stack_ids, &stacks.stacks[in_stack]),
+                    intern_global_stack(&mut global_stack_ids, &stacks.stacks[out_stack]),
+                );
                 let next_id = seq_ids.len();
                 disp.push(*seq_ids.entry(seq).or_insert(next_id));
             }
             disp.sort_unstable();
-            classes.entry(disp).or_default().push(id);
+            classes.entry(disp).or_default().push(result.token_id);
         } else {
-            invalid.push(id as i32);
+            invalid.push(result.token_id as i32);
         }
         if let Some(pb) = &bucket_pb {
             pb.inc(1);
@@ -2496,8 +2548,25 @@ mod tests {
             start: 0,
         };
         let tasks = vec![(vec![b'a'], 10), (vec![b'a', b'a'], 11), (vec![b'b'], 12)];
-        let got = compute_stack_in_out_for_trie(&tasks, &ig, None)
-            .into_iter()
+        let traversal = compute_stack_in_out_for_trie(&tasks, &ig, None);
+        let got = traversal
+            .tokens
+            .iter()
+            .map(|result| {
+                let materialized = result.stack_pairs.as_ref().map(|pairs| {
+                    let stacks = &traversal.stack_sets[result.stack_set];
+                    pairs
+                        .iter()
+                        .map(|(in_stack, out_stack)| {
+                            (
+                                stacks.stacks[*in_stack].clone(),
+                                stacks.stacks[*out_stack].clone(),
+                            )
+                        })
+                        .collect::<HashSet<_>>()
+                });
+                (result.token_id, materialized)
+            })
             .collect::<HashMap<_, _>>();
 
         let one_a = HashSet::from([(vec![0], Vec::new()), (vec![0], vec![0])]);
