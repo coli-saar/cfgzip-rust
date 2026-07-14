@@ -108,6 +108,99 @@ for batch in batches:
 `auto_pipeline` is just `load_and_compile` + `from_compiled`; use the split form above whenever you generate more than 
 once with the same grammar.
 
+## Rust preprocessor CLI
+
+This repository also contains a standalone Rust preprocessor, `cfgzip-preprocess`, intended as a faster replacement for
+the Python offline preprocessing step. It downloads HuggingFace tokenizer assets, computes token equivalence classes, and
+writes the same artifact layout consumed by `EquivalenceClassData.load()`:
+
+- `tc.pt`
+- `inv.pt`
+- `cr.pkl`
+
+The Rust terminal-regex lowering uses `regex-automata`, so class counts may be smaller than the Python implementation
+when the Rust automaton merges states that are language-equivalent.
+
+### Build
+
+Install a Rust toolchain, then build the optimized CLI:
+
+```bash
+cargo build --release
+```
+
+The repository configures aggressive release settings (`target-cpu=native`, fat LTO, one codegen unit). Release builds
+take longer, but this is the binary to use for timing.
+
+### Run
+
+For gated HuggingFace models, set `HF_TOKEN` first:
+
+```bash
+export HF_TOKEN=hf_...
+```
+
+In fish:
+
+```fish
+set -gx HF_TOKEN hf_...
+```
+
+Run preprocessing with a GBNF grammar file:
+
+```bash
+target/release/cfgzip-preprocess \
+  --model-id meta-llama/Llama-3.2-3B-Instruct \
+  --grammar-file /path/to/grammar.gbnf \
+  --output /path/to/output_dir \
+  --ignore-range 128000..128255 \
+  --skip-repeat-bytes \
+  --num-threads 16
+```
+
+The output directory must not already contain files. A preprocessing progress bar is shown by default; pass
+`--no-progress` for quiet output.
+
+### Paper C++ benchmark
+
+To run the same C++ grammar used by `preprocess_grammars.py`, write it to a file:
+
+```bash
+python - <<'PY'
+from grammars import cpp
+with open("/tmp/cfgzip_cpp.gbnf", "w") as f:
+    f.write(cpp.xgrammar_str)
+PY
+```
+
+Then time the Rust preprocessor:
+
+```bash
+rm -rf /tmp/cfgzip_llama_cpp_rust
+
+/usr/bin/time -p target/release/cfgzip-preprocess \
+  --model-id meta-llama/Llama-3.2-3B-Instruct \
+  --grammar-file /tmp/cfgzip_cpp.gbnf \
+  --output /tmp/cfgzip_llama_cpp_rust \
+  --ignore-range 128000..128255 \
+  --skip-repeat-bytes \
+  --num-threads 16
+```
+
+For an apples-to-apples Python comparison:
+
+```bash
+rm -rf /tmp/cfgzip_llama_cpp_python
+
+/usr/bin/time -p python preprocess_grammars.py \
+  --model llama \
+  --task cpp \
+  --output /tmp/cfgzip_llama_cpp_python \
+  --num-workers 16
+```
+
+Use Python 3.10 or newer for the Python comparison.
+
 ## Grammar format
 
 Grammars are written in **GBNF** (GGML BNF) — the grammar notation used by 
