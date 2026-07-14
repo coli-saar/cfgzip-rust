@@ -58,6 +58,12 @@ fn parse_range(s: &str) -> Result<(usize, usize), String> {
     ))
 }
 
+fn progress_style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template)
+        .unwrap()
+        .progress_chars("=> ")
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.num_threads < 1 {
@@ -80,7 +86,7 @@ fn main() -> Result<()> {
         parse_cfg_str(&grammar_str, &args.start_symbol)?;
     let normed = normalize_cfg(cfg, nfa_grammar, terminal_labels)?;
     let eq = compute_token_classes(&normed, &preterms, &tokens, eos_token_id, n_logits, &args)?;
-    write_output(&args.output, &eq)?;
+    write_output(&args.output, &eq, !args.no_progress)?;
     Ok(())
 }
 
@@ -1751,13 +1757,9 @@ fn compute_token_classes(
 
     let pb = if !args.no_progress {
         let pb = ProgressBar::new(tasks.len() as u64);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "preprocessing tokens [{elapsed_precise}] {wide_bar} {pos}/{len} ({per_sec}, eta {eta})",
-            )
-            .unwrap()
-            .progress_chars("=> "),
-        );
+        pb.set_style(progress_style(
+            "preprocessing tokens [{elapsed_precise}] {wide_bar} {pos}/{len} ({per_sec}, eta {eta})",
+        ));
         Some(pb)
     } else {
         None
@@ -1767,8 +1769,17 @@ fn compute_token_classes(
         pb.finish();
     }
 
-    let mut seq_ids: BTreeMap<(Vec<usize>, Vec<usize>), usize> = BTreeMap::new();
-    let mut classes: BTreeMap<Vec<usize>, Vec<usize>> = BTreeMap::new();
+    let bucket_pb = if !args.no_progress {
+        let pb = ProgressBar::new(results.len() as u64);
+        pb.set_style(progress_style(
+            "bucketing classes [{elapsed_precise}] {wide_bar} {pos}/{len} ({per_sec}, eta {eta})",
+        ));
+        Some(pb)
+    } else {
+        None
+    };
+    let mut seq_ids: HashMap<(Vec<usize>, Vec<usize>), usize> = HashMap::new();
+    let mut classes: HashMap<Vec<usize>, Vec<usize>> = HashMap::new();
     let mut invalid = Vec::new();
     for (id, stackio) in results {
         if let Some(stackio) = stackio {
@@ -1782,26 +1793,39 @@ fn compute_token_classes(
         } else {
             invalid.push(id as i32);
         }
+        if let Some(pb) = &bucket_pb {
+            pb.inc(1);
+        }
+    }
+    if let Some(pb) = &bucket_pb {
+        pb.finish();
     }
     let mut token_classes: Vec<Vec<usize>> = skip_classes.into_iter().map(|x| vec![x]).collect();
-    token_classes.extend(classes.into_values());
+    let mut grouped_classes = classes.into_values().collect::<Vec<_>>();
+    grouped_classes.sort_unstable_by_key(|class| class.iter().min().copied().unwrap_or(usize::MAX));
+    token_classes.extend(grouped_classes);
     token_classes.push(vec![eos]);
     let mut vec_out = vec![-1i32; n_logits];
-    let tok_rev: HashMap<usize, Vec<u8>> = tokens.iter().map(|(t, id)| (*id, t.clone())).collect();
+    let mut tok_rev = vec![None; n_logits];
+    for (tok, id) in tokens {
+        if *id < tok_rev.len() {
+            tok_rev[*id] = Some(tok);
+        }
+    }
     let mut reps = vec![Vec::<u8>::new(); token_classes.len()];
     for (i, class) in token_classes.iter().enumerate() {
-        let mut best: Option<Vec<u8>> = None;
+        let mut best: Option<&Vec<u8>> = None;
         for &id in class {
             if id < vec_out.len() {
                 vec_out[id] = i as i32;
             }
-            if let Some(tok) = tok_rev.get(&id) {
+            if let Some(tok) = tok_rev.get(id).and_then(|tok| *tok) {
                 if best.as_ref().map_or(true, |b| tok.len() < b.len()) {
-                    best = Some(tok.clone());
+                    best = Some(tok);
                 }
             }
         }
-        reps[i] = best.unwrap_or_default();
+        reps[i] = best.cloned().unwrap_or_default();
     }
     Ok(EquivOut {
         token_classes: vec_out,
@@ -1810,7 +1834,7 @@ fn compute_token_classes(
     })
 }
 
-fn write_output(path: &Path, eq: &EquivOut) -> Result<()> {
+fn write_output(path: &Path, eq: &EquivOut, show_progress: bool) -> Result<()> {
     if path.exists() {
         if !path.is_dir() {
             bail!("output exists and is not a directory: {}", path.display());
@@ -1821,8 +1845,25 @@ fn write_output(path: &Path, eq: &EquivOut) -> Result<()> {
     } else {
         fs::create_dir_all(path)?;
     }
-    write_raw_i32(path.join("tc.pt"), &eq.token_classes)?;
-    write_raw_i32(path.join("inv.pt"), &eq.invalid_tokens)?;
+    let reps_bytes = eq
+        .class_representatives
+        .iter()
+        .map(|rep| rep.len())
+        .sum::<usize>();
+    let write_units = (eq.token_classes.len() + eq.invalid_tokens.len())
+        * std::mem::size_of::<i32>()
+        + reps_bytes;
+    let pb = if show_progress {
+        let pb = ProgressBar::new(write_units as u64);
+        pb.set_style(progress_style(
+            "writing output [{elapsed_precise}] {wide_bar} {bytes}/{total_bytes} ({bytes_per_sec}, eta {eta})",
+        ));
+        Some(pb)
+    } else {
+        None
+    };
+    write_raw_i32(path.join("tc.pt"), &eq.token_classes, pb.as_ref())?;
+    write_raw_i32(path.join("inv.pt"), &eq.invalid_tokens, pb.as_ref())?;
     let mut f = BufWriter::new(File::create(path.join("cr.pkl"))?);
     let reps: Vec<serde_bytes::ByteBuf> = eq
         .class_representatives
@@ -1831,10 +1872,14 @@ fn write_output(path: &Path, eq: &EquivOut) -> Result<()> {
         .map(serde_bytes::ByteBuf::from)
         .collect();
     serde_pickle::to_writer(&mut f, &reps, Default::default())?;
+    if let Some(pb) = &pb {
+        pb.inc(reps_bytes as u64);
+        pb.finish();
+    }
     Ok(())
 }
 
-fn write_raw_i32(path: PathBuf, xs: &[i32]) -> Result<()> {
+fn write_raw_i32(path: PathBuf, xs: &[i32], pb: Option<&ProgressBar>) -> Result<()> {
     let root = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1853,8 +1898,16 @@ fn write_raw_i32(path: PathBuf, xs: &[i32]) -> Result<()> {
     zip.start_file(format!("{root}/byteorder"), opts)?;
     zip.write_all(b"little")?;
     zip.start_file(format!("{root}/data/0"), opts)?;
-    for &x in xs {
-        zip.write_all(&x.to_le_bytes())?;
+    let mut buf = Vec::with_capacity(64 * 1024);
+    for chunk in xs.chunks(16 * 1024) {
+        buf.clear();
+        for &x in chunk {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        zip.write_all(&buf)?;
+        if let Some(pb) = pb {
+            pb.inc(buf.len() as u64);
+        }
     }
     zip.start_file(format!("{root}/version"), opts)?;
     zip.write_all(b"3\n")?;
@@ -2414,15 +2467,15 @@ mod tests {
             invalid_tokens: vec![1],
             class_representatives: vec![b"a".to_vec(), b"<eos>".to_vec()],
         };
-        write_output(&out_dir, &eq).unwrap();
+        write_output(&out_dir, &eq, false).unwrap();
         assert!(out_dir.join("tc.pt").is_file());
         assert!(out_dir.join("inv.pt").is_file());
         assert!(out_dir.join("cr.pkl").is_file());
-        assert!(write_output(&out_dir, &eq).is_err());
+        assert!(write_output(&out_dir, &eq, false).is_err());
 
         let file_path = dir.path().join("already-a-file");
         fs::write(&file_path, b"x").unwrap();
-        assert!(write_output(&file_path, &eq).is_err());
+        assert!(write_output(&file_path, &eq, false).is_err());
     }
 
     #[test]
