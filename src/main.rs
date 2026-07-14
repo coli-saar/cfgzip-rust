@@ -1222,12 +1222,18 @@ struct IntGrammar {
     start: usize,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SearchState {
-    in_stack: Vec<usize>,
-    out_stack: Vec<usize>,
+    in_stack: usize,
+    out_stack: usize,
     prev_symbol: Option<usize>,
     allow_bt: bool,
+}
+
+#[derive(Clone)]
+struct StackInterner {
+    stacks: Vec<Vec<usize>>,
+    ids: HashMap<Vec<usize>, usize>,
 }
 
 #[derive(Default)]
@@ -1239,6 +1245,81 @@ struct TokenTrieNode {
 struct TrieJob {
     node_id: usize,
     frontier: HashSet<SearchState>,
+    stacks: StackInterner,
+}
+
+impl StackInterner {
+    fn new() -> Self {
+        let mut ids = HashMap::new();
+        ids.insert(Vec::new(), 0);
+        Self {
+            stacks: vec![Vec::new()],
+            ids,
+        }
+    }
+
+    fn intern_vec(&mut self, stack: Vec<usize>) -> usize {
+        if let Some(&id) = self.ids.get(&stack) {
+            return id;
+        }
+        let id = self.stacks.len();
+        self.stacks.push(stack.clone());
+        self.ids.insert(stack, id);
+        id
+    }
+
+    fn intern_slice(&mut self, stack: &[usize]) -> usize {
+        if stack.is_empty() {
+            return 0;
+        }
+        self.intern_vec(stack.to_vec())
+    }
+
+    fn push(&mut self, stack_id: usize, sym: usize) -> usize {
+        let mut stack = self.stacks[stack_id].clone();
+        stack.push(sym);
+        self.intern_vec(stack)
+    }
+
+    fn prepend_to_tail(&mut self, prefix: &[usize], tail_id: usize, tail_start: usize) -> usize {
+        if prefix.is_empty() && tail_start == self.stacks[tail_id].len() {
+            return 0;
+        }
+        let tail = &self.stacks[tail_id];
+        let mut stack = Vec::with_capacity(prefix.len() + tail.len().saturating_sub(tail_start));
+        stack.extend_from_slice(prefix);
+        stack.extend_from_slice(&tail[tail_start..]);
+        self.intern_vec(stack)
+    }
+
+    fn first(&self, stack_id: usize) -> Option<usize> {
+        self.stacks[stack_id].first().copied()
+    }
+
+    fn is_empty(&self, stack_id: usize) -> bool {
+        self.stacks[stack_id].is_empty()
+    }
+
+    fn materialize(&self, stack_id: usize) -> Vec<usize> {
+        self.stacks[stack_id].clone()
+    }
+}
+
+fn rebase_frontier(
+    frontier: &HashSet<SearchState>,
+    stacks: &StackInterner,
+) -> (StackInterner, HashSet<SearchState>) {
+    let mut rebased_stacks = StackInterner::new();
+    let rebased_frontier = frontier
+        .iter()
+        .map(|state| SearchState {
+            in_stack: rebased_stacks.intern_slice(&stacks.stacks[state.in_stack]),
+            out_stack: rebased_stacks.intern_slice(&stacks.stacks[state.out_stack]),
+            prev_symbol: state.prev_symbol,
+            allow_bt: state.allow_bt,
+        })
+        .collect();
+    (rebased_stacks, rebased_frontier)
 }
 
 fn compute_stack_adj(
@@ -1325,34 +1406,38 @@ fn compute_subtree_token_counts(nodes: &[TokenTrieNode]) -> Vec<usize> {
     counts
 }
 
-fn initial_frontier(start: usize) -> HashSet<SearchState> {
-    HashSet::from([
+fn initial_frontier(start: usize) -> (StackInterner, HashSet<SearchState>) {
+    let mut stacks = StackInterner::new();
+    let start_stack = stacks.intern_slice(&[start]);
+    let frontier = HashSet::from([
         SearchState {
-            in_stack: Vec::new(),
-            out_stack: Vec::new(),
+            in_stack: 0,
+            out_stack: 0,
             prev_symbol: None,
             allow_bt: true,
         },
         SearchState {
-            in_stack: vec![start],
-            out_stack: vec![start],
+            in_stack: start_stack,
+            out_stack: start_stack,
             prev_symbol: None,
             allow_bt: false,
         },
-    ])
+    ]);
+    (stacks, frontier)
 }
 
 fn advance_frontier(
     frontier: &HashSet<SearchState>,
     byte: u8,
     ig: &IntGrammar,
+    stacks: &mut StackInterner,
 ) -> HashSet<SearchState> {
     let Some(pts) = ig.preterms_rev.get(&byte) else {
         return HashSet::new();
     };
     let mut next_states = HashSet::new();
     for state in frontier {
-        if state.out_stack.is_empty() {
+        if stacks.is_empty(state.out_stack) {
             if !state.allow_bt {
                 continue;
             }
@@ -1366,11 +1451,11 @@ fn advance_frontier(
                         {
                             if let Some(outs) = ig.transitions.get(&(pt, s)) {
                                 for t0_out in outs {
-                                    let mut ins = state.in_stack.clone();
-                                    ins.push(s);
+                                    let ins = stacks.push(state.in_stack, s);
+                                    let out_stack = stacks.intern_slice(t0_out);
                                     next_states.insert(SearchState {
                                         in_stack: ins,
-                                        out_stack: t0_out.clone(),
+                                        out_stack,
                                         prev_symbol: Some(s),
                                         allow_bt: state.allow_bt,
                                     });
@@ -1381,14 +1466,13 @@ fn advance_frontier(
                 }
             }
         } else {
-            let head = state.out_stack[0];
+            let head = stacks.first(state.out_stack).unwrap();
             for &pt in pts {
                 if let Some(outs) = ig.transitions.get(&(pt, head)) {
                     for t0_out in outs {
-                        let mut new_out = t0_out.clone();
-                        new_out.extend_from_slice(&state.out_stack[1..]);
+                        let new_out = stacks.prepend_to_tail(t0_out, state.out_stack, 1);
                         next_states.insert(SearchState {
-                            in_stack: state.in_stack.clone(),
+                            in_stack: state.in_stack,
                             out_stack: new_out,
                             prev_symbol: Some(head),
                             allow_bt: state.allow_bt,
@@ -1403,10 +1487,16 @@ fn advance_frontier(
 
 fn frontier_stack_in_out(
     frontier: &HashSet<SearchState>,
+    stacks: &StackInterner,
 ) -> Option<HashSet<(Vec<usize>, Vec<usize>)>> {
     let out = frontier
         .iter()
-        .map(|s| (s.in_stack.clone(), s.out_stack.clone()))
+        .map(|s| {
+            (
+                stacks.materialize(s.in_stack),
+                stacks.materialize(s.out_stack),
+            )
+        })
         .collect::<HashSet<_>>();
     (!out.is_empty()).then_some(out)
 }
@@ -1415,6 +1505,7 @@ fn collect_token_trie_results(
     nodes: &[TokenTrieNode],
     node_id: usize,
     frontier: &HashSet<SearchState>,
+    stacks: &mut StackInterner,
     ig: &IntGrammar,
     out: &mut Vec<(usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>)>,
 ) {
@@ -1422,7 +1513,7 @@ fn collect_token_trie_results(
     let stackio = if node.token_ids.is_empty() {
         None
     } else {
-        frontier_stack_in_out(frontier)
+        frontier_stack_in_out(frontier, stacks)
     };
     for &id in &node.token_ids {
         out.push((id, stackio.clone()));
@@ -1430,9 +1521,9 @@ fn collect_token_trie_results(
     let mut children = node.children.iter().collect::<Vec<_>>();
     children.sort_unstable_by_key(|(b, _)| **b);
     for (&byte, &child_id) in children {
-        let next = advance_frontier(frontier, byte, ig);
+        let next = advance_frontier(frontier, byte, ig, stacks);
         if !next.is_empty() {
-            collect_token_trie_results(nodes, child_id, &next, ig, out);
+            collect_token_trie_results(nodes, child_id, &next, stacks, ig, out);
         } else {
             collect_invalid_subtree(nodes, child_id, out);
         }
@@ -1460,6 +1551,7 @@ fn collect_token_trie_jobs(
     subtree_token_counts: &[usize],
     node_id: usize,
     frontier: HashSet<SearchState>,
+    stacks: &mut StackInterner,
     depth: usize,
     ig: &IntGrammar,
     immediate: &mut Vec<(usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>)>,
@@ -1469,12 +1561,17 @@ fn collect_token_trie_jobs(
     const MAX_SPLIT_DEPTH: usize = 8;
 
     if subtree_token_counts[node_id] <= MAX_JOB_TOKENS || depth >= MAX_SPLIT_DEPTH {
-        jobs.push(TrieJob { node_id, frontier });
+        let (rebased_stacks, rebased_frontier) = rebase_frontier(&frontier, stacks);
+        jobs.push(TrieJob {
+            node_id,
+            frontier: rebased_frontier,
+            stacks: rebased_stacks,
+        });
         return;
     }
 
     let node = &nodes[node_id];
-    let stackio = frontier_stack_in_out(&frontier);
+    let stackio = frontier_stack_in_out(&frontier, stacks);
     for &id in &node.token_ids {
         immediate.push((id, stackio.clone()));
     }
@@ -1482,7 +1579,7 @@ fn collect_token_trie_jobs(
     let mut children = node.children.iter().collect::<Vec<_>>();
     children.sort_unstable_by_key(|(b, _)| **b);
     for (&byte, &child_id) in children {
-        let next = advance_frontier(&frontier, byte, ig);
+        let next = advance_frontier(&frontier, byte, ig, stacks);
         if next.is_empty() {
             collect_invalid_subtree(nodes, child_id, immediate);
         } else {
@@ -1491,6 +1588,7 @@ fn collect_token_trie_jobs(
                 subtree_token_counts,
                 child_id,
                 next,
+                stacks,
                 depth + 1,
                 ig,
                 immediate,
@@ -1507,7 +1605,7 @@ fn compute_stack_in_out_for_trie(
 ) -> Vec<(usize, Option<HashSet<(Vec<usize>, Vec<usize>)>>)> {
     let trie = build_token_trie(tasks);
     let subtree_token_counts = compute_subtree_token_counts(&trie);
-    let root_frontier = initial_frontier(ig.start);
+    let (mut root_stacks, root_frontier) = initial_frontier(ig.start);
     let mut immediate_results = Vec::new();
     let mut jobs = Vec::new();
     for &id in &trie[0].token_ids {
@@ -1516,7 +1614,7 @@ fn compute_stack_in_out_for_trie(
     let mut root_children = trie[0].children.iter().collect::<Vec<_>>();
     root_children.sort_unstable_by_key(|(b, _)| **b);
     for (&byte, &child_id) in root_children {
-        let frontier = advance_frontier(&root_frontier, byte, ig);
+        let frontier = advance_frontier(&root_frontier, byte, ig, &mut root_stacks);
         if frontier.is_empty() {
             collect_invalid_subtree(&trie, child_id, &mut immediate_results);
         } else {
@@ -1525,6 +1623,7 @@ fn compute_stack_in_out_for_trie(
                 &subtree_token_counts,
                 child_id,
                 frontier,
+                &mut root_stacks,
                 1,
                 ig,
                 &mut immediate_results,
@@ -1537,9 +1636,17 @@ fn compute_stack_in_out_for_trie(
     }
     let job_results = jobs
         .into_par_iter()
-        .map(|job| {
+        .map(|mut job| {
             let mut out = Vec::new();
-            collect_token_trie_results(&trie, job.node_id, &job.frontier, ig, &mut out);
+            let frontier = job.frontier;
+            collect_token_trie_results(
+                &trie,
+                job.node_id,
+                &frontier,
+                &mut job.stacks,
+                ig,
+                &mut out,
+            );
             if let Some(pb) = pb {
                 pb.inc(out.len() as u64);
             }
