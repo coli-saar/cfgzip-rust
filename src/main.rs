@@ -11,8 +11,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 use tokenizers::Tokenizer;
 
 type Symbol = String;
@@ -23,7 +21,6 @@ type FastHashMap<K, V> = HashMap<K, V, AHashRandomState>;
 type FastHashSet<T> = HashSet<T, AHashRandomState>;
 type ScanTransitions = [FastHashMap<usize, Vec<Vec<usize>>>; 256];
 type BacktrackTransitions = [FastHashMap<Option<usize>, Vec<BacktrackTransition>>; 256];
-const STATS_DEPTH_BUCKETS: usize = 64;
 fn fast_hash_map<K, V>() -> FastHashMap<K, V> {
     HashMap::with_hasher(AHashRandomState::new())
 }
@@ -62,8 +59,6 @@ struct Args {
     cache_dir: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     no_progress: bool,
-    #[arg(long, default_value_t = false)]
-    debug_stats: bool,
 }
 
 fn parse_range(s: &str) -> Result<(usize, usize), String> {
@@ -1249,22 +1244,6 @@ struct EquivOut {
     class_representatives: Vec<Vec<u8>>,
 }
 
-struct BucketPairShape {
-    token_id: usize,
-    pairs: usize,
-    unique_pairs: usize,
-    unique_in_stacks: usize,
-    unique_out_stacks: usize,
-    min_in_stack_len: usize,
-    median_in_stack_len: usize,
-    max_in_stack_len: usize,
-    min_out_stack_len: usize,
-    median_out_stack_len: usize,
-    max_out_stack_len: usize,
-    top_out_counts: Vec<(usize, usize, usize)>,
-    top_in_counts: Vec<(usize, usize, usize)>,
-}
-
 #[derive(Clone)]
 struct IntGrammar {
     scan_transitions: ScanTransitions,
@@ -1335,7 +1314,6 @@ struct TokenTrieEdge {
 
 struct TrieJob {
     node_id: usize,
-    depth: usize,
     frontier: FactoredFrontier,
     stacks: StackInterner,
     in_sets: InStackSetInterner,
@@ -1362,7 +1340,6 @@ struct TrieTraversal<'a> {
     nodes: &'a [TokenTrieNode],
     subtree_token_counts: &'a [usize],
     ig: &'a IntGrammar,
-    stats: Option<&'a TraversalStats>,
 }
 
 struct TrieJobOutputs<'a> {
@@ -1370,6 +1347,7 @@ struct TrieJobOutputs<'a> {
     jobs: &'a mut Vec<TrieJob>,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct TokenTrieStats {
     raw_nodes: usize,
@@ -1385,488 +1363,6 @@ struct TokenTrieStats {
     homogeneous_edges: usize,
     max_homogeneous_run_len: usize,
     homogeneous_run_cache_candidate_edges: usize,
-}
-
-#[derive(Default)]
-struct FrontierShape {
-    states: usize,
-    unique_in_stacks: usize,
-    unique_out_stacks: usize,
-    unique_stack_pairs: usize,
-    unique_out_prev_allow: usize,
-    unique_top_prev_allow: usize,
-}
-
-struct AdvanceObservation {
-    depth: usize,
-    input_states: usize,
-    empty_out: usize,
-    nonempty_out: usize,
-    candidate_states: usize,
-    output_states: usize,
-    dead_prev_erased: usize,
-    scan_output_candidates: usize,
-    backtrack_output_candidates: usize,
-}
-
-struct TraversalStats {
-    advances: AtomicU64,
-    input_states: AtomicU64,
-    empty_out_input_states: AtomicU64,
-    nonempty_out_input_states: AtomicU64,
-    candidate_states: AtomicU64,
-    output_states: AtomicU64,
-    deduped_states: AtomicU64,
-    dead_prev_erased: AtomicU64,
-    scan_output_candidates: AtomicU64,
-    backtrack_output_candidates: AtomicU64,
-    invalid_subtree_tokens: AtomicU64,
-    valid_token_results: AtomicU64,
-    jobs: AtomicU64,
-    rebase_input_states: AtomicU64,
-    rebase_output_states: AtomicU64,
-    max_input_frontier: AtomicU64,
-    max_candidate_frontier: AtomicU64,
-    max_output_frontier: AtomicU64,
-    max_stack_count: AtomicU64,
-    max_stack_len: AtomicU64,
-    shape_observations: AtomicU64,
-    shape_states: AtomicU64,
-    shape_unique_in_stacks: AtomicU64,
-    shape_unique_out_stacks: AtomicU64,
-    shape_unique_stack_pairs: AtomicU64,
-    shape_unique_out_prev_allow: AtomicU64,
-    shape_unique_top_prev_allow: AtomicU64,
-    max_shape_states: AtomicU64,
-    max_shape_stack_pairs: AtomicU64,
-    max_shape_out_prev_allow: AtomicU64,
-    max_shape_top_prev_allow: AtomicU64,
-    in_set_union_calls: AtomicU64,
-    in_set_union_input_members: AtomicU64,
-    in_set_union_output_members: AtomicU64,
-    in_set_push_all_calls: AtomicU64,
-    in_set_push_all_hits: AtomicU64,
-    in_set_push_all_input_members: AtomicU64,
-    in_set_push_all_output_members: AtomicU64,
-    stack_pair_materialize_calls: AtomicU64,
-    stack_pair_materialize_pairs: AtomicU64,
-    rebase_factored_groups: AtomicU64,
-    rebase_in_set_members: AtomicU64,
-    max_factored_groups: AtomicU64,
-    label_edges: AtomicU64,
-    label_bytes: AtomicU64,
-    homogeneous_label_edges: AtomicU64,
-    max_label_len: AtomicU64,
-    max_homogeneous_label_len: AtomicU64,
-    run_edges: AtomicU64,
-    max_run_output_states: AtomicU64,
-    max_run_materialized_states: AtomicU64,
-    max_run_byte: AtomicU64,
-    max_run_len: AtomicU64,
-    max_materialized_run_states: AtomicU64,
-    max_materialized_run_byte: AtomicU64,
-    max_materialized_run_len: AtomicU64,
-    depth_advances: Vec<AtomicU64>,
-    depth_candidate_states: Vec<AtomicU64>,
-    depth_output_states: Vec<AtomicU64>,
-    depth_max_output_frontier: Vec<AtomicU64>,
-}
-
-impl TraversalStats {
-    fn new() -> Self {
-        Self {
-            advances: AtomicU64::new(0),
-            input_states: AtomicU64::new(0),
-            empty_out_input_states: AtomicU64::new(0),
-            nonempty_out_input_states: AtomicU64::new(0),
-            candidate_states: AtomicU64::new(0),
-            output_states: AtomicU64::new(0),
-            deduped_states: AtomicU64::new(0),
-            dead_prev_erased: AtomicU64::new(0),
-            scan_output_candidates: AtomicU64::new(0),
-            backtrack_output_candidates: AtomicU64::new(0),
-            invalid_subtree_tokens: AtomicU64::new(0),
-            valid_token_results: AtomicU64::new(0),
-            jobs: AtomicU64::new(0),
-            rebase_input_states: AtomicU64::new(0),
-            rebase_output_states: AtomicU64::new(0),
-            max_input_frontier: AtomicU64::new(0),
-            max_candidate_frontier: AtomicU64::new(0),
-            max_output_frontier: AtomicU64::new(0),
-            max_stack_count: AtomicU64::new(0),
-            max_stack_len: AtomicU64::new(0),
-            shape_observations: AtomicU64::new(0),
-            shape_states: AtomicU64::new(0),
-            shape_unique_in_stacks: AtomicU64::new(0),
-            shape_unique_out_stacks: AtomicU64::new(0),
-            shape_unique_stack_pairs: AtomicU64::new(0),
-            shape_unique_out_prev_allow: AtomicU64::new(0),
-            shape_unique_top_prev_allow: AtomicU64::new(0),
-            max_shape_states: AtomicU64::new(0),
-            max_shape_stack_pairs: AtomicU64::new(0),
-            max_shape_out_prev_allow: AtomicU64::new(0),
-            max_shape_top_prev_allow: AtomicU64::new(0),
-            in_set_union_calls: AtomicU64::new(0),
-            in_set_union_input_members: AtomicU64::new(0),
-            in_set_union_output_members: AtomicU64::new(0),
-            in_set_push_all_calls: AtomicU64::new(0),
-            in_set_push_all_hits: AtomicU64::new(0),
-            in_set_push_all_input_members: AtomicU64::new(0),
-            in_set_push_all_output_members: AtomicU64::new(0),
-            stack_pair_materialize_calls: AtomicU64::new(0),
-            stack_pair_materialize_pairs: AtomicU64::new(0),
-            rebase_factored_groups: AtomicU64::new(0),
-            rebase_in_set_members: AtomicU64::new(0),
-            max_factored_groups: AtomicU64::new(0),
-            label_edges: AtomicU64::new(0),
-            label_bytes: AtomicU64::new(0),
-            homogeneous_label_edges: AtomicU64::new(0),
-            max_label_len: AtomicU64::new(0),
-            max_homogeneous_label_len: AtomicU64::new(0),
-            run_edges: AtomicU64::new(0),
-            max_run_output_states: AtomicU64::new(0),
-            max_run_materialized_states: AtomicU64::new(0),
-            max_run_byte: AtomicU64::new(0),
-            max_run_len: AtomicU64::new(0),
-            max_materialized_run_states: AtomicU64::new(0),
-            max_materialized_run_byte: AtomicU64::new(0),
-            max_materialized_run_len: AtomicU64::new(0),
-            depth_advances: (0..STATS_DEPTH_BUCKETS)
-                .map(|_| AtomicU64::new(0))
-                .collect(),
-            depth_candidate_states: (0..STATS_DEPTH_BUCKETS)
-                .map(|_| AtomicU64::new(0))
-                .collect(),
-            depth_output_states: (0..STATS_DEPTH_BUCKETS)
-                .map(|_| AtomicU64::new(0))
-                .collect(),
-            depth_max_output_frontier: (0..STATS_DEPTH_BUCKETS)
-                .map(|_| AtomicU64::new(0))
-                .collect(),
-        }
-    }
-
-    fn add(cell: &AtomicU64, value: usize) {
-        cell.fetch_add(value as u64, Ordering::Relaxed);
-    }
-
-    fn bump(cell: &AtomicU64) {
-        cell.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn max(cell: &AtomicU64, value: usize) {
-        let value = value as u64;
-        let mut current = cell.load(Ordering::Relaxed);
-        while value > current {
-            match cell.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(next) => current = next,
-            }
-        }
-    }
-
-    fn depth_bucket(depth: usize) -> usize {
-        depth.min(STATS_DEPTH_BUCKETS - 1)
-    }
-
-    fn observe_advance(&self, observation: AdvanceObservation) {
-        Self::bump(&self.advances);
-        Self::add(&self.input_states, observation.input_states);
-        Self::add(&self.empty_out_input_states, observation.empty_out);
-        Self::add(&self.nonempty_out_input_states, observation.nonempty_out);
-        Self::add(&self.candidate_states, observation.candidate_states);
-        Self::add(&self.output_states, observation.output_states);
-        Self::add(
-            &self.deduped_states,
-            observation
-                .candidate_states
-                .saturating_sub(observation.output_states),
-        );
-        Self::add(&self.dead_prev_erased, observation.dead_prev_erased);
-        Self::add(
-            &self.scan_output_candidates,
-            observation.scan_output_candidates,
-        );
-        Self::add(
-            &self.backtrack_output_candidates,
-            observation.backtrack_output_candidates,
-        );
-        Self::max(&self.max_input_frontier, observation.input_states);
-        Self::max(&self.max_candidate_frontier, observation.candidate_states);
-        Self::max(&self.max_output_frontier, observation.output_states);
-        let bucket = Self::depth_bucket(observation.depth);
-        Self::bump(&self.depth_advances[bucket]);
-        Self::add(
-            &self.depth_candidate_states[bucket],
-            observation.candidate_states,
-        );
-        Self::add(&self.depth_output_states[bucket], observation.output_states);
-        Self::max(
-            &self.depth_max_output_frontier[bucket],
-            observation.output_states,
-        );
-    }
-
-    fn observe_stacks(&self, stacks: &StackInterner) {
-        Self::max(&self.max_stack_count, stacks.stacks.len());
-        if let Some(max_len) = stacks.stacks.iter().map(Vec::len).max() {
-            Self::max(&self.max_stack_len, max_len);
-        }
-    }
-
-    fn observe_frontier_shape(&self, shape: FrontierShape) {
-        if shape.states == 0 {
-            return;
-        }
-        Self::bump(&self.shape_observations);
-        Self::add(&self.shape_states, shape.states);
-        Self::add(&self.shape_unique_in_stacks, shape.unique_in_stacks);
-        Self::add(&self.shape_unique_out_stacks, shape.unique_out_stacks);
-        Self::add(&self.shape_unique_stack_pairs, shape.unique_stack_pairs);
-        Self::add(
-            &self.shape_unique_out_prev_allow,
-            shape.unique_out_prev_allow,
-        );
-        Self::add(
-            &self.shape_unique_top_prev_allow,
-            shape.unique_top_prev_allow,
-        );
-        Self::max(&self.max_shape_states, shape.states);
-        Self::max(&self.max_shape_stack_pairs, shape.unique_stack_pairs);
-        Self::max(&self.max_shape_out_prev_allow, shape.unique_out_prev_allow);
-        Self::max(&self.max_shape_top_prev_allow, shape.unique_top_prev_allow);
-    }
-
-    fn observe_factored_groups(&self, groups: usize) {
-        Self::max(&self.max_factored_groups, groups);
-    }
-
-    fn observe_in_set_union(&self, left: usize, right: usize, output: usize) {
-        Self::bump(&self.in_set_union_calls);
-        Self::add(&self.in_set_union_input_members, left + right);
-        Self::add(&self.in_set_union_output_members, output);
-    }
-
-    fn observe_in_set_push_all(&self, input: usize, output: usize, hit: bool) {
-        Self::bump(&self.in_set_push_all_calls);
-        if hit {
-            Self::bump(&self.in_set_push_all_hits);
-        }
-        Self::add(&self.in_set_push_all_input_members, input);
-        Self::add(&self.in_set_push_all_output_members, output);
-    }
-
-    fn observe_stack_pair_materialization(&self, pairs: usize) {
-        Self::bump(&self.stack_pair_materialize_calls);
-        Self::add(&self.stack_pair_materialize_pairs, pairs);
-    }
-
-    fn observe_factored_rebase(&self, groups: usize, members: usize) {
-        Self::add(&self.rebase_factored_groups, groups);
-        Self::add(&self.rebase_in_set_members, members);
-    }
-
-    fn observe_label(&self, label: &[u8]) {
-        Self::bump(&self.label_edges);
-        Self::add(&self.label_bytes, label.len());
-        Self::max(&self.max_label_len, label.len());
-        if is_homogeneous(label) {
-            Self::bump(&self.homogeneous_label_edges);
-            Self::max(&self.max_homogeneous_label_len, label.len());
-        }
-    }
-
-    fn observe_run(&self, byte: u8, len: usize, output_states: usize, materialized_states: usize) {
-        Self::bump(&self.run_edges);
-        let output = output_states as u64;
-        let mut current = self.max_run_output_states.load(Ordering::Relaxed);
-        while output > current {
-            match self.max_run_output_states.compare_exchange_weak(
-                current,
-                output,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.max_run_byte.store(byte as u64, Ordering::Relaxed);
-                    self.max_run_len.store(len as u64, Ordering::Relaxed);
-                    self.max_run_materialized_states
-                        .store(materialized_states as u64, Ordering::Relaxed);
-                    break;
-                }
-                Err(next) => current = next,
-            }
-        }
-        let materialized = materialized_states as u64;
-        let mut current = self.max_materialized_run_states.load(Ordering::Relaxed);
-        while materialized > current {
-            match self.max_materialized_run_states.compare_exchange_weak(
-                current,
-                materialized,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.max_materialized_run_byte
-                        .store(byte as u64, Ordering::Relaxed);
-                    self.max_materialized_run_len
-                        .store(len as u64, Ordering::Relaxed);
-                    break;
-                }
-                Err(next) => current = next,
-            }
-        }
-    }
-
-    fn print(&self, trie: &TokenTrieStats) {
-        let advances = self.advances.load(Ordering::Relaxed).max(1);
-        let candidate_states = self.candidate_states.load(Ordering::Relaxed);
-        let output_states = self.output_states.load(Ordering::Relaxed);
-        eprintln!("cfgzip debug stats: traversal");
-        eprintln!(
-            "  trie: raw_nodes={} raw_edges={} nodes={} edges={} leaves={} tokens={} max_depth={} max_children={} max_tokens_at_node={}",
-            trie.raw_nodes,
-            trie.raw_edges,
-            trie.nodes,
-            trie.edges,
-            trie.leaves,
-            trie.tokens,
-            trie.max_depth,
-            trie.max_children,
-            trie.max_tokens_at_node
-        );
-        eprintln!(
-            "  compressed trie: longest_edge_label={} homogeneous_edges={} max_homogeneous_run_len={} homogeneous_run_cache_candidate_edges={} edge_ratio={:.2}",
-            trie.max_edge_label_len,
-            trie.homogeneous_edges,
-            trie.max_homogeneous_run_len,
-            trie.homogeneous_run_cache_candidate_edges,
-            trie.raw_edges as f64 / trie.edges.max(1) as f64
-        );
-        eprintln!(
-            "  advances={} input_states={} empty_out_inputs={} nonempty_out_inputs={}",
-            advances,
-            self.input_states.load(Ordering::Relaxed),
-            self.empty_out_input_states.load(Ordering::Relaxed),
-            self.nonempty_out_input_states.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "  candidates={} outputs={} deduped={} dead_prev_erased={}",
-            candidate_states,
-            output_states,
-            self.deduped_states.load(Ordering::Relaxed),
-            self.dead_prev_erased.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "  avg_candidate_per_advance={:.2} avg_output_per_advance={:.2}",
-            candidate_states as f64 / advances as f64,
-            output_states as f64 / advances as f64
-        );
-        eprintln!(
-            "  scan_output_candidates={} backtrack_output_candidates={}",
-            self.scan_output_candidates.load(Ordering::Relaxed),
-            self.backtrack_output_candidates.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "  valid_token_results={} invalid_subtree_tokens={} jobs={} rebase_in={} rebase_out={}",
-            self.valid_token_results.load(Ordering::Relaxed),
-            self.invalid_subtree_tokens.load(Ordering::Relaxed),
-            self.jobs.load(Ordering::Relaxed),
-            self.rebase_input_states.load(Ordering::Relaxed),
-            self.rebase_output_states.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "  max_frontier: input={} candidate={} output={} max_stack_count={} max_stack_len={}",
-            self.max_input_frontier.load(Ordering::Relaxed),
-            self.max_candidate_frontier.load(Ordering::Relaxed),
-            self.max_output_frontier.load(Ordering::Relaxed),
-            self.max_stack_count.load(Ordering::Relaxed),
-            self.max_stack_len.load(Ordering::Relaxed)
-        );
-        let shape_observations = self.shape_observations.load(Ordering::Relaxed).max(1);
-        let shape_states = self.shape_states.load(Ordering::Relaxed).max(1);
-        let shape_stack_pairs = self.shape_unique_stack_pairs.load(Ordering::Relaxed);
-        let shape_out_prev_allow = self.shape_unique_out_prev_allow.load(Ordering::Relaxed);
-        let shape_top_prev_allow = self.shape_unique_top_prev_allow.load(Ordering::Relaxed);
-        eprintln!(
-            "  frontier shape: observations={} avg_states={:.2} avg_in_stacks={:.2} avg_out_stacks={:.2}",
-            shape_observations,
-            shape_states as f64 / shape_observations as f64,
-            self.shape_unique_in_stacks.load(Ordering::Relaxed) as f64
-                / shape_observations as f64,
-            self.shape_unique_out_stacks.load(Ordering::Relaxed) as f64
-                / shape_observations as f64
-        );
-        eprintln!(
-            "  frontier shape ratios: states/stack_pair={:.2} states/out_prev_allow={:.2} states/top_prev_allow={:.2}",
-            shape_states as f64 / shape_stack_pairs.max(1) as f64,
-            shape_states as f64 / shape_out_prev_allow.max(1) as f64,
-            shape_states as f64 / shape_top_prev_allow.max(1) as f64
-        );
-        eprintln!(
-            "  frontier shape max: states={} stack_pairs={} out_prev_allow={} top_prev_allow={}",
-            self.max_shape_states.load(Ordering::Relaxed),
-            self.max_shape_stack_pairs.load(Ordering::Relaxed),
-            self.max_shape_out_prev_allow.load(Ordering::Relaxed),
-            self.max_shape_top_prev_allow.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "  factored work: max_groups={} materialize_calls={} materialize_pairs={} rebase_groups={} rebase_members={}",
-            self.max_factored_groups.load(Ordering::Relaxed),
-            self.stack_pair_materialize_calls.load(Ordering::Relaxed),
-            self.stack_pair_materialize_pairs.load(Ordering::Relaxed),
-            self.rebase_factored_groups.load(Ordering::Relaxed),
-            self.rebase_in_set_members.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "  in-set ops: union_calls={} union_input_members={} union_output_members={} push_all_calls={} push_all_hits={} push_all_input_members={} push_all_output_members={}",
-            self.in_set_union_calls.load(Ordering::Relaxed),
-            self.in_set_union_input_members.load(Ordering::Relaxed),
-            self.in_set_union_output_members.load(Ordering::Relaxed),
-            self.in_set_push_all_calls.load(Ordering::Relaxed),
-            self.in_set_push_all_hits.load(Ordering::Relaxed),
-            self.in_set_push_all_input_members.load(Ordering::Relaxed),
-            self.in_set_push_all_output_members.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "  label/run work: labels={} label_bytes={} homogeneous_labels={} max_label_len={} max_homogeneous_label_len={} runs={} max_run_output_states={} max_run_materialized_states={} max_run_byte={} max_run_len={} max_materialized_run_states={} max_materialized_run_byte={} max_materialized_run_len={}",
-            self.label_edges.load(Ordering::Relaxed),
-            self.label_bytes.load(Ordering::Relaxed),
-            self.homogeneous_label_edges.load(Ordering::Relaxed),
-            self.max_label_len.load(Ordering::Relaxed),
-            self.max_homogeneous_label_len.load(Ordering::Relaxed),
-            self.run_edges.load(Ordering::Relaxed),
-            self.max_run_output_states.load(Ordering::Relaxed),
-            self.max_run_materialized_states.load(Ordering::Relaxed),
-            self.max_run_byte.load(Ordering::Relaxed),
-            self.max_run_len.load(Ordering::Relaxed),
-            self.max_materialized_run_states.load(Ordering::Relaxed),
-            self.max_materialized_run_byte.load(Ordering::Relaxed),
-            self.max_materialized_run_len.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "  depth buckets with work: depth advances candidates outputs max_output_frontier"
-        );
-        for depth in 0..STATS_DEPTH_BUCKETS {
-            let advances = self.depth_advances[depth].load(Ordering::Relaxed);
-            if advances == 0 {
-                continue;
-            }
-            let label = if depth == STATS_DEPTH_BUCKETS - 1 {
-                format!("{}+", depth)
-            } else {
-                depth.to_string()
-            };
-            eprintln!(
-                "    {} {} {} {} {}",
-                label,
-                advances,
-                self.depth_candidate_states[depth].load(Ordering::Relaxed),
-                self.depth_output_states[depth].load(Ordering::Relaxed),
-                self.depth_max_output_frontier[depth].load(Ordering::Relaxed)
-            );
-        }
-    }
 }
 
 impl StackInterner {
@@ -1981,7 +1477,7 @@ impl InStackSetInterner {
         id
     }
 
-    fn union(&mut self, a: usize, b: usize, stats: Option<&TraversalStats>) -> usize {
+    fn union(&mut self, a: usize, b: usize) -> usize {
         if a == b {
             return a;
         }
@@ -1996,28 +1492,16 @@ impl InStackSetInterner {
             return id;
         }
         let id = self.intern_vec(merge_sorted_unique(&self.sets[key.0], &self.sets[key.1]));
-        if let Some(stats) = stats {
-            stats.observe_in_set_union(self.len(key.0), self.len(key.1), self.len(id));
-        }
         self.union_cache.insert(key, id);
         id
     }
 
-    fn push_all(
-        &mut self,
-        set_id: usize,
-        sym: usize,
-        stacks: &mut StackInterner,
-        stats: Option<&TraversalStats>,
-    ) -> usize {
+    fn push_all(&mut self, set_id: usize, sym: usize, stacks: &mut StackInterner) -> usize {
         if self.len(set_id) == 0 {
             return set_id;
         }
         let key = (set_id, sym);
         if let Some(&id) = self.push_all_cache.get(&key) {
-            if let Some(stats) = stats {
-                stats.observe_in_set_push_all(self.len(set_id), self.len(id), true);
-            }
             return id;
         }
         let pushed = self
@@ -2026,9 +1510,6 @@ impl InStackSetInterner {
             .map(|stack| stacks.push(stack, sym))
             .collect::<Vec<_>>();
         let id = self.intern_vec(pushed);
-        if let Some(stats) = stats {
-            stats.observe_in_set_push_all(self.len(set_id), self.len(id), false);
-        }
         self.push_all_cache.insert(key, id);
         id
     }
@@ -2113,7 +1594,6 @@ fn canonicalize_factored_frontier(
     frontier: &mut FactoredFrontier,
     stacks: &StackInterner,
     in_sets: &mut InStackSetInterner,
-    stats: Option<&TraversalStats>,
 ) -> usize {
     let mut dead_prev_erased = 0usize;
     for state in frontier.iter_mut() {
@@ -2130,24 +1610,14 @@ fn canonicalize_factored_frontier(
     for state in frontier.drain(..) {
         if let Some(last) = merged.last_mut() {
             if last.control == state.control {
-                last.in_stack_set = in_sets.union(last.in_stack_set, state.in_stack_set, stats);
+                last.in_stack_set = in_sets.union(last.in_stack_set, state.in_stack_set);
                 continue;
             }
         }
         merged.push(state);
     }
-    if let Some(stats) = stats {
-        stats.observe_factored_groups(merged.len());
-    }
     *frontier = merged;
     dead_prev_erased
-}
-
-fn factored_materialized_len(frontier: &[FactoredState], in_sets: &InStackSetInterner) -> usize {
-    frontier
-        .iter()
-        .map(|state| in_sets.len(state.in_stack_set))
-        .sum()
 }
 
 fn factor_frontier(
@@ -2166,77 +1636,8 @@ fn factor_frontier(
             in_stack_set: in_sets.singleton(state.in_stack),
         })
         .collect::<Vec<_>>();
-    canonicalize_factored_frontier(&mut factored, stacks, in_sets, None);
+    canonicalize_factored_frontier(&mut factored, stacks, in_sets);
     factored
-}
-
-#[cfg(test)]
-fn compute_frontier_shape(frontier: &[SearchState], stacks: &StackInterner) -> FrontierShape {
-    let mut in_stacks = fast_hash_set();
-    let mut out_stacks = fast_hash_set();
-    let mut stack_pairs = fast_hash_set();
-    let mut out_prev_allow = fast_hash_set();
-    let mut top_prev_allow = fast_hash_set();
-
-    for state in frontier {
-        in_stacks.insert(state.in_stack);
-        out_stacks.insert(state.out_stack);
-        stack_pairs.insert((state.in_stack, state.out_stack));
-        out_prev_allow.insert((state.out_stack, state.prev_symbol, state.allow_bt));
-        top_prev_allow.insert((
-            stacks.first(state.out_stack),
-            state.prev_symbol,
-            state.allow_bt,
-        ));
-    }
-
-    FrontierShape {
-        states: frontier.len(),
-        unique_in_stacks: in_stacks.len(),
-        unique_out_stacks: out_stacks.len(),
-        unique_stack_pairs: stack_pairs.len(),
-        unique_out_prev_allow: out_prev_allow.len(),
-        unique_top_prev_allow: top_prev_allow.len(),
-    }
-}
-
-fn compute_factored_frontier_shape(
-    frontier: &[FactoredState],
-    stacks: &StackInterner,
-    in_sets: &mut InStackSetInterner,
-) -> FrontierShape {
-    let mut in_stacks = fast_hash_set();
-    let mut out_stacks = fast_hash_set();
-    let mut stack_pairs = fast_hash_set();
-    let mut out_prev_allow = fast_hash_set();
-    let mut top_prev_allow = fast_hash_set();
-
-    for state in frontier {
-        out_stacks.insert(state.control.out_stack);
-        out_prev_allow.insert((
-            state.control.out_stack,
-            state.control.prev_symbol,
-            state.control.allow_bt,
-        ));
-        top_prev_allow.insert((
-            stacks.first(state.control.out_stack),
-            state.control.prev_symbol,
-            state.control.allow_bt,
-        ));
-        for in_stack in in_sets.members_vec(state.in_stack_set) {
-            in_stacks.insert(in_stack);
-            stack_pairs.insert((in_stack, state.control.out_stack));
-        }
-    }
-
-    FrontierShape {
-        states: factored_materialized_len(frontier, in_sets),
-        unique_in_stacks: in_stacks.len(),
-        unique_out_stacks: out_stacks.len(),
-        unique_stack_pairs: stack_pairs.len(),
-        unique_out_prev_allow: out_prev_allow.len(),
-        unique_top_prev_allow: top_prev_allow.len(),
-    }
 }
 
 fn rebase_factored_frontier(
@@ -2264,12 +1665,7 @@ fn rebase_factored_frontier(
             }
         })
         .collect::<FactoredFrontier>();
-    canonicalize_factored_frontier(
-        &mut rebased_frontier,
-        &rebased_stacks,
-        &mut rebased_in_sets,
-        None,
-    );
+    canonicalize_factored_frontier(&mut rebased_frontier, &rebased_stacks, &mut rebased_in_sets);
     (rebased_stacks, rebased_in_sets, rebased_frontier)
 }
 
@@ -2283,76 +1679,6 @@ fn intern_global_stack(
     let id = global_stacks.len();
     global_stacks.insert(stack.to_vec(), id);
     id
-}
-
-fn debug_token_bytes(token: &[u8]) -> String {
-    let escaped = String::from_utf8_lossy(token).escape_debug().to_string();
-    format!("{escaped:?} bytes={token:?}")
-}
-
-fn compute_bucket_pair_shape(
-    token_id: usize,
-    stack_pairs: &[(usize, usize)],
-    stacks: &StackInterner,
-) -> BucketPairShape {
-    let mut unique_pairs = fast_hash_set();
-    let mut in_counts: FastHashMap<usize, usize> = fast_hash_map();
-    let mut out_counts: FastHashMap<usize, usize> = fast_hash_map();
-    for &(in_stack, out_stack) in stack_pairs {
-        unique_pairs.insert((in_stack, out_stack));
-        *in_counts.entry(in_stack).or_default() += 1;
-        *out_counts.entry(out_stack).or_default() += 1;
-    }
-
-    fn len_summary(
-        ids: impl Iterator<Item = usize>,
-        stacks: &StackInterner,
-    ) -> (usize, usize, usize) {
-        let mut lens = ids
-            .map(|stack_id| stacks.stacks[stack_id].len())
-            .collect::<Vec<_>>();
-        if lens.is_empty() {
-            return (0, 0, 0);
-        }
-        lens.sort_unstable();
-        (lens[0], lens[lens.len() / 2], lens[lens.len() - 1])
-    }
-
-    fn top_counts(
-        counts: &FastHashMap<usize, usize>,
-        stacks: &StackInterner,
-    ) -> Vec<(usize, usize, usize)> {
-        let mut top = counts
-            .iter()
-            .map(|(&stack_id, &count)| (count, stack_id, stacks.stacks[stack_id].len()))
-            .collect::<Vec<_>>();
-        top.sort_unstable_by(|a, b| b.cmp(a));
-        top.truncate(8);
-        top
-    }
-
-    let (min_in_stack_len, median_in_stack_len, max_in_stack_len) =
-        len_summary(in_counts.keys().copied(), stacks);
-    let (min_out_stack_len, median_out_stack_len, max_out_stack_len) =
-        len_summary(out_counts.keys().copied(), stacks);
-    let top_out_counts = top_counts(&out_counts, stacks);
-    let top_in_counts = top_counts(&in_counts, stacks);
-
-    BucketPairShape {
-        token_id,
-        pairs: stack_pairs.len(),
-        unique_pairs: unique_pairs.len(),
-        unique_in_stacks: in_counts.len(),
-        unique_out_stacks: out_counts.len(),
-        min_in_stack_len,
-        median_in_stack_len,
-        max_in_stack_len,
-        min_out_stack_len,
-        median_out_stack_len,
-        max_out_stack_len,
-        top_out_counts,
-        top_in_counts,
-    }
 }
 
 fn compute_stack_adj(
@@ -2443,188 +1769,6 @@ fn build_byte_transition_tables(
     (scan_transitions, backtrack_transitions)
 }
 
-fn print_grammar_debug_stats(
-    preterms_rev: &[Vec<usize>; 256],
-    ig: &IntGrammar,
-    n_symbols: usize,
-    tasks: &[(Vec<u8>, usize)],
-) {
-    type ByteKey = (
-        Vec<(usize, Vec<Vec<usize>>)>,
-        Vec<(Option<usize>, Vec<(usize, Vec<Vec<usize>>)>)>,
-    );
-
-    let active_bytes = preterms_rev
-        .iter()
-        .enumerate()
-        .filter(|(_, pts)| !pts.is_empty())
-        .map(|(byte, _)| byte)
-        .collect::<Vec<_>>();
-    let token_bytes = tasks
-        .iter()
-        .flat_map(|(tok, _)| tok.iter().copied())
-        .collect::<HashSet<_>>();
-    let mut byte_classes: BTreeMap<ByteKey, Vec<usize>> = BTreeMap::new();
-    let mut total_preterm_links = 0usize;
-    let mut max_preterms_per_byte = 0usize;
-    let mut total_scan_entries = 0usize;
-    let mut total_scan_outs = 0usize;
-    let mut max_scan_outs_per_byte = 0usize;
-    let mut total_backtrack_entries = 0usize;
-    let mut total_backtrack_outs = 0usize;
-    let mut max_backtrack_outs_per_byte = 0usize;
-    let mut unique_scan_output_stacks = BTreeSet::new();
-    let mut unique_backtrack_output_stacks = BTreeSet::new();
-    let mut max_transition_output_stack_len = 0usize;
-
-    for byte in 0..=u8::MAX {
-        let byte_idx = byte as usize;
-        total_preterm_links += preterms_rev[byte_idx].len();
-        max_preterms_per_byte = max_preterms_per_byte.max(preterms_rev[byte_idx].len());
-
-        let mut scan_key = ig.scan_transitions[byte_idx]
-            .iter()
-            .map(|(&head, outs)| {
-                let mut outs = outs.clone();
-                outs.sort_unstable();
-                (head, outs)
-            })
-            .collect::<Vec<_>>();
-        scan_key.sort_unstable();
-
-        let mut backtrack_key = ig.backtrack_transitions[byte_idx]
-            .iter()
-            .map(|(&prev, transitions)| {
-                let mut transitions = transitions
-                    .iter()
-                    .map(|transition| {
-                        let mut outs = transition.outs.clone();
-                        outs.sort_unstable();
-                        (transition.start, outs)
-                    })
-                    .collect::<Vec<_>>();
-                transitions.sort_unstable();
-                (prev, transitions)
-            })
-            .collect::<Vec<_>>();
-        backtrack_key.sort_unstable();
-
-        let scan_outs = scan_key.iter().map(|(_, outs)| outs.len()).sum::<usize>();
-        let backtrack_outs = backtrack_key
-            .iter()
-            .map(|(_, transitions)| {
-                transitions
-                    .iter()
-                    .map(|(_, outs)| outs.len())
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-        for (_, outs) in &scan_key {
-            for out in outs {
-                max_transition_output_stack_len = max_transition_output_stack_len.max(out.len());
-                unique_scan_output_stacks.insert(out.clone());
-            }
-        }
-        for (_, transitions) in &backtrack_key {
-            for (_, outs) in transitions {
-                for out in outs {
-                    max_transition_output_stack_len =
-                        max_transition_output_stack_len.max(out.len());
-                    unique_backtrack_output_stacks.insert(out.clone());
-                }
-            }
-        }
-        total_scan_entries += scan_key.len();
-        total_scan_outs += scan_outs;
-        max_scan_outs_per_byte = max_scan_outs_per_byte.max(scan_outs);
-        total_backtrack_entries += backtrack_key.len();
-        total_backtrack_outs += backtrack_outs;
-        max_backtrack_outs_per_byte = max_backtrack_outs_per_byte.max(backtrack_outs);
-        byte_classes
-            .entry((scan_key, backtrack_key))
-            .or_default()
-            .push(byte_idx);
-    }
-
-    let token_byte_classes = byte_classes
-        .values()
-        .filter(|bytes| {
-            bytes
-                .iter()
-                .any(|byte| token_bytes.contains(&(*byte as u8)))
-        })
-        .count();
-    let largest_class = byte_classes.values().map(Vec::len).max().unwrap_or(0);
-    let singleton_classes = byte_classes
-        .values()
-        .filter(|bytes| bytes.len() == 1)
-        .count();
-    let mut largest_classes = byte_classes.values().collect::<Vec<_>>();
-    largest_classes.sort_unstable_by_key(|bytes| std::cmp::Reverse(bytes.len()));
-    let mut byte_to_class = [0usize; 256];
-    for (class_id, bytes) in byte_classes.values().enumerate() {
-        for &byte in bytes {
-            byte_to_class[byte] = class_id;
-        }
-    }
-    let raw_trie_stats = compute_sequence_trie_stats(tasks, |tok| {
-        tok.iter().copied().map(usize::from).collect::<Vec<_>>()
-    });
-    let class_trie_stats = compute_sequence_trie_stats(tasks, |tok| {
-        tok.iter()
-            .map(|&byte| byte_to_class[byte as usize])
-            .collect::<Vec<_>>()
-    });
-
-    eprintln!("cfgzip debug stats: grammar");
-    eprintln!(
-        "  symbols={} tasks={} token_bytes={} active_grammar_bytes={} byte_equiv_classes={} token_byte_equiv_classes={}",
-        n_symbols,
-        tasks.len(),
-        token_bytes.len(),
-        active_bytes.len(),
-        byte_classes.len(),
-        token_byte_classes
-    );
-    eprintln!(
-        "  preterm_links={} max_preterms_per_byte={} scan_entries={} scan_outs={} max_scan_outs_per_byte={}",
-        total_preterm_links,
-        max_preterms_per_byte,
-        total_scan_entries,
-        total_scan_outs,
-        max_scan_outs_per_byte
-    );
-    eprintln!(
-        "  backtrack_entries={} backtrack_outs={} max_backtrack_outs_per_byte={}",
-        total_backtrack_entries, total_backtrack_outs, max_backtrack_outs_per_byte
-    );
-    eprintln!(
-        "  transition output stacks: scan_unique={} backtrack_unique={} max_len={} scan_reuse={:.2} backtrack_reuse={:.2}",
-        unique_scan_output_stacks.len(),
-        unique_backtrack_output_stacks.len(),
-        max_transition_output_stack_len,
-        total_scan_outs as f64 / unique_scan_output_stacks.len().max(1) as f64,
-        total_backtrack_outs as f64 / unique_backtrack_output_stacks.len().max(1) as f64
-    );
-    eprintln!(
-        "  byte_equiv_singletons={} largest_byte_equiv_class={}",
-        singleton_classes, largest_class
-    );
-    eprintln!(
-        "  token trie opportunity: raw_nodes={} class_nodes={} raw_edges={} class_edges={} node_ratio={:.2} edge_ratio={:.2}",
-        raw_trie_stats.nodes,
-        class_trie_stats.nodes,
-        raw_trie_stats.edges,
-        class_trie_stats.edges,
-        raw_trie_stats.nodes as f64 / class_trie_stats.nodes.max(1) as f64,
-        raw_trie_stats.edges as f64 / class_trie_stats.edges.max(1) as f64
-    );
-    eprintln!("  largest byte-equivalence classes:");
-    for bytes in largest_classes.into_iter().take(5) {
-        eprintln!("    size={} bytes={:?}", bytes.len(), bytes);
-    }
-}
-
 #[derive(Default)]
 struct RawTokenTrieNode {
     children: BTreeMap<u8, usize>,
@@ -2694,54 +1838,7 @@ fn build_token_trie(tasks: &[(Vec<u8>, usize)]) -> Vec<TokenTrieNode> {
     out
 }
 
-fn compute_sequence_trie_stats<I, F>(tasks: &[(Vec<u8>, usize)], mut keys: F) -> TokenTrieStats
-where
-    I: IntoIterator<Item = usize>,
-    F: FnMut(&[u8]) -> I,
-{
-    #[derive(Default)]
-    struct Node {
-        children: BTreeMap<usize, usize>,
-        token_ids: usize,
-    }
-
-    let mut nodes = vec![Node::default()];
-    for (tok, _) in tasks {
-        let mut node = 0usize;
-        for key in keys(tok) {
-            if let Some(&next) = nodes[node].children.get(&key) {
-                node = next;
-            } else {
-                let next = nodes.len();
-                nodes.push(Node::default());
-                nodes[node].children.insert(key, next);
-                node = next;
-            }
-        }
-        nodes[node].token_ids += 1;
-    }
-
-    fn rec(nodes: &[Node], node_id: usize, depth: usize, stats: &mut TokenTrieStats) {
-        let node = &nodes[node_id];
-        stats.nodes += 1;
-        stats.edges += node.children.len();
-        stats.tokens += node.token_ids;
-        stats.max_depth = stats.max_depth.max(depth);
-        stats.max_children = stats.max_children.max(node.children.len());
-        stats.max_tokens_at_node = stats.max_tokens_at_node.max(node.token_ids);
-        if node.token_ids != 0 {
-            stats.leaves += 1;
-        }
-        for &child_id in node.children.values() {
-            rec(nodes, child_id, depth + 1, stats);
-        }
-    }
-
-    let mut stats = TokenTrieStats::default();
-    rec(&nodes, 0, 0, &mut stats);
-    stats
-}
-
+#[cfg(test)]
 fn compute_token_trie_stats(nodes: &[TokenTrieNode]) -> TokenTrieStats {
     fn rec(
         nodes: &[TokenTrieNode],
@@ -2845,35 +1942,15 @@ fn advance_frontier(
     byte: u8,
     ig: &IntGrammar,
     stacks: &mut StackInterner,
-    depth: usize,
-    stats: Option<&TraversalStats>,
 ) -> Frontier {
     let scan_by_head = &ig.scan_transitions[byte as usize];
     let backtrack_by_prev = &ig.backtrack_transitions[byte as usize];
     if scan_by_head.is_empty() && backtrack_by_prev.is_empty() {
-        if let Some(stats) = stats {
-            stats.observe_advance(AdvanceObservation {
-                depth,
-                input_states: frontier.len(),
-                empty_out: 0,
-                nonempty_out: 0,
-                candidate_states: 0,
-                output_states: 0,
-                dead_prev_erased: 0,
-                scan_output_candidates: 0,
-                backtrack_output_candidates: 0,
-            });
-        }
         return Vec::new();
     }
     let mut next_states = Vec::with_capacity(frontier.len().saturating_mul(2));
-    let mut empty_out = 0usize;
-    let mut nonempty_out = 0usize;
-    let mut scan_output_candidates = 0usize;
-    let mut backtrack_output_candidates = 0usize;
     for state in frontier {
         if stacks.is_empty(state.out_stack) {
-            empty_out += 1;
             if !state.allow_bt {
                 continue;
             }
@@ -2881,7 +1958,6 @@ fn advance_frontier(
                 for transition in transitions {
                     let ins = stacks.push(state.in_stack, transition.start);
                     for t0_out in &transition.outs {
-                        backtrack_output_candidates += 1;
                         let out_stack = stacks.intern_slice(t0_out);
                         next_states.push(SearchState {
                             in_stack: ins,
@@ -2893,11 +1969,9 @@ fn advance_frontier(
                 }
             }
         } else {
-            nonempty_out += 1;
             let head = stacks.first(state.out_stack).unwrap();
             if let Some(outs) = scan_by_head.get(&head) {
                 for t0_out in outs {
-                    scan_output_candidates += 1;
                     let new_out = stacks.prepend_to_tail(t0_out, state.out_stack, 1);
                     next_states.push(SearchState {
                         in_stack: state.in_stack,
@@ -2909,24 +1983,7 @@ fn advance_frontier(
             }
         }
     }
-    let candidate_states = next_states.len();
-    let dead_prev_erased = canonicalize_frontier(&mut next_states, stacks);
-    if let Some(stats) = stats {
-        let shape = compute_frontier_shape(&next_states, stacks);
-        stats.observe_advance(AdvanceObservation {
-            depth,
-            input_states: frontier.len(),
-            empty_out,
-            nonempty_out,
-            candidate_states,
-            output_states: next_states.len(),
-            dead_prev_erased,
-            scan_output_candidates,
-            backtrack_output_candidates,
-        });
-        stats.observe_frontier_shape(shape);
-        stats.observe_stacks(stacks);
-    }
+    canonicalize_frontier(&mut next_states, stacks);
     next_states
 }
 
@@ -2936,51 +1993,25 @@ fn advance_factored_frontier(
     ig: &IntGrammar,
     stacks: &mut StackInterner,
     in_sets: &mut InStackSetInterner,
-    depth: usize,
-    stats: Option<&TraversalStats>,
 ) -> FactoredFrontier {
     let scan_by_head = &ig.scan_transitions[byte as usize];
     let backtrack_by_prev = &ig.backtrack_transitions[byte as usize];
-    let input_states = factored_materialized_len(frontier, in_sets);
     if scan_by_head.is_empty() && backtrack_by_prev.is_empty() {
-        if let Some(stats) = stats {
-            stats.observe_advance(AdvanceObservation {
-                depth,
-                input_states,
-                empty_out: 0,
-                nonempty_out: 0,
-                candidate_states: 0,
-                output_states: 0,
-                dead_prev_erased: 0,
-                scan_output_candidates: 0,
-                backtrack_output_candidates: 0,
-            });
-        }
         return Vec::new();
     }
 
     let mut next_states = Vec::new();
-    let mut empty_out = 0usize;
-    let mut nonempty_out = 0usize;
-    let mut candidate_states = 0usize;
-    let mut scan_output_candidates = 0usize;
-    let mut backtrack_output_candidates = 0usize;
 
     for state in frontier {
-        let in_count = in_sets.len(state.in_stack_set);
         if stacks.is_empty(state.control.out_stack) {
-            empty_out += in_count;
             if !state.control.allow_bt {
                 continue;
             }
             if let Some(transitions) = backtrack_by_prev.get(&state.control.prev_symbol) {
                 for transition in transitions {
                     let pushed_in_stack_set =
-                        in_sets.push_all(state.in_stack_set, transition.start, stacks, stats);
-                    let pushed_len = in_sets.len(pushed_in_stack_set);
+                        in_sets.push_all(state.in_stack_set, transition.start, stacks);
                     for t0_out in &transition.outs {
-                        backtrack_output_candidates += in_count;
-                        candidate_states += pushed_len;
                         let out_stack = stacks.intern_slice(t0_out);
                         next_states.push(FactoredState {
                             control: ControlKey {
@@ -2994,12 +2025,9 @@ fn advance_factored_frontier(
                 }
             }
         } else {
-            nonempty_out += in_count;
             let head = stacks.first(state.control.out_stack).unwrap();
             if let Some(outs) = scan_by_head.get(&head) {
                 for t0_out in outs {
-                    scan_output_candidates += in_count;
-                    candidate_states += in_count;
                     let new_out = stacks.prepend_to_tail(t0_out, state.control.out_stack, 1);
                     next_states.push(FactoredState {
                         control: ControlKey {
@@ -3014,24 +2042,7 @@ fn advance_factored_frontier(
         }
     }
 
-    let dead_prev_erased = canonicalize_factored_frontier(&mut next_states, stacks, in_sets, stats);
-    let output_states = factored_materialized_len(&next_states, in_sets);
-    if let Some(stats) = stats {
-        let shape = compute_factored_frontier_shape(&next_states, stacks, in_sets);
-        stats.observe_advance(AdvanceObservation {
-            depth,
-            input_states,
-            empty_out,
-            nonempty_out,
-            candidate_states,
-            output_states,
-            dead_prev_erased,
-            scan_output_candidates,
-            backtrack_output_candidates,
-        });
-        stats.observe_frontier_shape(shape);
-        stats.observe_stacks(stacks);
-    }
+    canonicalize_factored_frontier(&mut next_states, stacks, in_sets);
     next_states
 }
 
@@ -3041,33 +2052,14 @@ fn advance_run(
     len: usize,
     stacks: &mut StackInterner,
     in_sets: &mut InStackSetInterner,
-    depth: usize,
     traversal: TrieTraversal<'_>,
 ) -> FactoredFrontier {
     let mut current = frontier.to_vec();
-    let mut current_depth = depth;
     for _ in 0..len {
-        current_depth += 1;
-        current = advance_factored_frontier(
-            &current,
-            byte,
-            traversal.ig,
-            stacks,
-            in_sets,
-            current_depth,
-            traversal.stats,
-        );
+        current = advance_factored_frontier(&current, byte, traversal.ig, stacks, in_sets);
         if current.is_empty() {
             break;
         }
-    }
-    if let Some(stats) = traversal.stats {
-        stats.observe_run(
-            byte,
-            len,
-            current.len(),
-            factored_materialized_len(&current, in_sets),
-        );
     }
     current
 }
@@ -3086,7 +2078,6 @@ fn frontier_stack_pairs(frontier: &[SearchState]) -> Option<Vec<(usize, usize)>>
 fn factored_frontier_stack_pairs(
     frontier: &[FactoredState],
     in_sets: &mut InStackSetInterner,
-    stats: Option<&TraversalStats>,
 ) -> Option<Vec<(usize, usize)>> {
     let mut out = Vec::new();
     for state in frontier {
@@ -3099,9 +2090,6 @@ fn factored_frontier_stack_pairs(
     }
     out.sort_unstable();
     out.dedup();
-    if let Some(stats) = stats {
-        stats.observe_stack_pair_materialization(out.len());
-    }
     (!out.is_empty()).then_some(out)
 }
 
@@ -3110,13 +2098,9 @@ fn push_valid_token_results(
     frontier: &[FactoredState],
     in_sets: &mut InStackSetInterner,
     out: &mut Vec<LocalTokenResult>,
-    stats: Option<&TraversalStats>,
 ) {
-    let stack_pairs = factored_frontier_stack_pairs(frontier, in_sets, stats);
+    let stack_pairs = factored_frontier_stack_pairs(frontier, in_sets);
     for &id in ids {
-        if let Some(stats) = stats {
-            TraversalStats::bump(&stats.valid_token_results);
-        }
         out.push(LocalTokenResult {
             token_id: id,
             stack_pairs: stack_pairs.clone(),
@@ -3124,15 +2108,8 @@ fn push_valid_token_results(
     }
 }
 
-fn push_invalid_token_results(
-    ids: &[usize],
-    out: &mut Vec<LocalTokenResult>,
-    stats: Option<&TraversalStats>,
-) {
+fn push_invalid_token_results(ids: &[usize], out: &mut Vec<LocalTokenResult>) {
     for &id in ids {
-        if let Some(stats) = stats {
-            TraversalStats::bump(&stats.invalid_subtree_tokens);
-        }
         out.push(LocalTokenResult {
             token_id: id,
             stack_pairs: None,
@@ -3144,10 +2121,9 @@ fn collect_invalid_edge_terminals(
     edge: &TokenTrieEdge,
     start_offset_index: usize,
     out: &mut Vec<LocalTokenResult>,
-    stats: Option<&TraversalStats>,
 ) {
     for (_, ids) in edge.token_offsets.iter().skip(start_offset_index) {
-        push_invalid_token_results(ids, out, stats);
+        push_invalid_token_results(ids, out);
     }
 }
 
@@ -3157,13 +2133,9 @@ fn advance_edge_and_emit_terminals(
     stacks: &mut StackInterner,
     in_sets: &mut InStackSetInterner,
     out: &mut Vec<LocalTokenResult>,
-    depth: usize,
     traversal: TrieTraversal<'_>,
 ) -> Option<FactoredFrontier> {
     if is_homogeneous(&edge.label) {
-        if let Some(stats) = traversal.stats {
-            stats.observe_label(&edge.label);
-        }
         if edge.token_offsets.is_empty() {
             return Some(advance_run(
                 frontier,
@@ -3171,7 +2143,6 @@ fn advance_edge_and_emit_terminals(
                 edge.label.len(),
                 stacks,
                 in_sets,
-                depth,
                 traversal,
             ));
         }
@@ -3179,63 +2150,36 @@ fn advance_edge_and_emit_terminals(
         let mut current = frontier.to_vec();
         let mut offset_index = 0usize;
         for offset in 1..=edge.label.len() {
-            current = advance_factored_frontier(
-                &current,
-                byte,
-                traversal.ig,
-                stacks,
-                in_sets,
-                depth + offset,
-                traversal.stats,
-            );
+            current = advance_factored_frontier(&current, byte, traversal.ig, stacks, in_sets);
             if current.is_empty() {
-                collect_invalid_edge_terminals(edge, offset_index, out, traversal.stats);
+                collect_invalid_edge_terminals(edge, offset_index, out);
                 return None;
             }
             while offset_index < edge.token_offsets.len()
                 && edge.token_offsets[offset_index].0 == offset
             {
                 let ids = &edge.token_offsets[offset_index].1;
-                push_valid_token_results(ids, &current, in_sets, out, traversal.stats);
+                push_valid_token_results(ids, &current, in_sets, out);
                 offset_index += 1;
             }
-        }
-        if let Some(stats) = traversal.stats {
-            stats.observe_run(
-                byte,
-                edge.label.len(),
-                current.len(),
-                factored_materialized_len(&current, in_sets),
-            );
         }
         return Some(current);
     }
 
-    if let Some(stats) = traversal.stats {
-        stats.observe_label(&edge.label);
-    }
     let mut current = frontier.to_vec();
     let mut offset_index = 0usize;
     for (byte_index, &byte) in edge.label.iter().enumerate() {
         let offset = byte_index + 1;
-        current = advance_factored_frontier(
-            &current,
-            byte,
-            traversal.ig,
-            stacks,
-            in_sets,
-            depth + offset,
-            traversal.stats,
-        );
+        current = advance_factored_frontier(&current, byte, traversal.ig, stacks, in_sets);
         if current.is_empty() {
-            collect_invalid_edge_terminals(edge, offset_index, out, traversal.stats);
+            collect_invalid_edge_terminals(edge, offset_index, out);
             return None;
         }
         while offset_index < edge.token_offsets.len()
             && edge.token_offsets[offset_index].0 == offset
         {
             let ids = &edge.token_offsets[offset_index].1;
-            push_valid_token_results(ids, &current, in_sets, out, traversal.stats);
+            push_valid_token_results(ids, &current, in_sets, out);
             offset_index += 1;
         }
     }
@@ -3250,28 +2194,18 @@ fn collect_token_trie_results(
     stacks: &mut StackInterner,
     in_sets: &mut InStackSetInterner,
     out: &mut Vec<LocalTokenResult>,
-    depth: usize,
 ) {
     let node = &traversal.nodes[node_id];
     if !node.token_ids.is_empty() {
-        push_valid_token_results(&node.token_ids, frontier, in_sets, out, traversal.stats);
+        push_valid_token_results(&node.token_ids, frontier, in_sets, out);
     }
     for edge in node.children.values() {
-        let next =
-            advance_edge_and_emit_terminals(edge, frontier, stacks, in_sets, out, depth, traversal);
+        let next = advance_edge_and_emit_terminals(edge, frontier, stacks, in_sets, out, traversal);
         if let Some(next) = next {
-            collect_token_trie_results(
-                traversal,
-                edge.child,
-                &next,
-                stacks,
-                in_sets,
-                out,
-                depth + edge.label.len(),
-            );
+            collect_token_trie_results(traversal, edge.child, &next, stacks, in_sets, out);
         } else {
-            collect_invalid_edge_terminals(edge, edge.token_offsets.len(), out, traversal.stats);
-            collect_invalid_subtree(traversal.nodes, edge.child, out, traversal.stats);
+            collect_invalid_edge_terminals(edge, edge.token_offsets.len(), out);
+            collect_invalid_subtree(traversal.nodes, edge.child, out);
         }
     }
 }
@@ -3280,13 +2214,12 @@ fn collect_invalid_subtree(
     nodes: &[TokenTrieNode],
     node_id: usize,
     out: &mut Vec<LocalTokenResult>,
-    stats: Option<&TraversalStats>,
 ) {
     let node = &nodes[node_id];
-    push_invalid_token_results(&node.token_ids, out, stats);
+    push_invalid_token_results(&node.token_ids, out);
     for edge in node.children.values() {
-        collect_invalid_edge_terminals(edge, 0, out, stats);
-        collect_invalid_subtree(nodes, edge.child, out, stats);
+        collect_invalid_edge_terminals(edge, 0, out);
+        collect_invalid_subtree(nodes, edge.child, out);
     }
 }
 
@@ -3305,25 +2238,8 @@ fn collect_token_trie_jobs(
     if traversal.subtree_token_counts[node_id] <= MAX_JOB_TOKENS || depth >= MAX_SPLIT_DEPTH {
         let (rebased_stacks, rebased_in_sets, rebased_frontier) =
             rebase_factored_frontier(&frontier, stacks, in_sets);
-        if let Some(stats) = traversal.stats {
-            TraversalStats::bump(&stats.jobs);
-            stats.observe_factored_rebase(
-                frontier.len(),
-                factored_materialized_len(&frontier, in_sets),
-            );
-            TraversalStats::add(
-                &stats.rebase_input_states,
-                factored_materialized_len(&frontier, in_sets),
-            );
-            TraversalStats::add(
-                &stats.rebase_output_states,
-                factored_materialized_len(&rebased_frontier, &rebased_in_sets),
-            );
-            stats.observe_stacks(&rebased_stacks);
-        }
         outputs.jobs.push(TrieJob {
             node_id,
-            depth,
             frontier: rebased_frontier,
             stacks: rebased_stacks,
             in_sets: rebased_in_sets,
@@ -3333,13 +2249,7 @@ fn collect_token_trie_jobs(
 
     let node = &traversal.nodes[node_id];
     if !node.token_ids.is_empty() {
-        push_valid_token_results(
-            &node.token_ids,
-            &frontier,
-            in_sets,
-            outputs.immediate,
-            traversal.stats,
-        );
+        push_valid_token_results(&node.token_ids, &frontier, in_sets, outputs.immediate);
     }
 
     for edge in node.children.values() {
@@ -3349,7 +2259,6 @@ fn collect_token_trie_jobs(
             stacks,
             in_sets,
             outputs.immediate,
-            depth,
             traversal,
         );
         if let Some(next) = next {
@@ -3363,18 +2272,8 @@ fn collect_token_trie_jobs(
                 outputs,
             );
         } else {
-            collect_invalid_edge_terminals(
-                edge,
-                edge.token_offsets.len(),
-                outputs.immediate,
-                traversal.stats,
-            );
-            collect_invalid_subtree(
-                traversal.nodes,
-                edge.child,
-                outputs.immediate,
-                traversal.stats,
-            );
+            collect_invalid_edge_terminals(edge, edge.token_offsets.len(), outputs.immediate);
+            collect_invalid_subtree(traversal.nodes, edge.child, outputs.immediate);
         }
     }
 }
@@ -3383,29 +2282,20 @@ fn compute_stack_in_out_for_trie(
     tasks: &[(Vec<u8>, usize)],
     ig: &IntGrammar,
     pb: Option<&ProgressBar>,
-    stats: Option<&TraversalStats>,
 ) -> TokenTraversalResults {
     let trie = build_token_trie(tasks);
-    let trie_stats = compute_token_trie_stats(&trie);
     let subtree_token_counts = compute_subtree_token_counts(&trie);
     let traversal = TrieTraversal {
         nodes: &trie,
         subtree_token_counts: &subtree_token_counts,
         ig,
-        stats,
     };
     let (mut root_stacks, root_frontier_flat) = initial_frontier(ig.start);
     let mut root_in_sets = InStackSetInterner::new();
     let root_frontier = factor_frontier(&root_frontier_flat, &root_stacks, &mut root_in_sets);
-    if let Some(stats) = stats {
-        stats.observe_stacks(&root_stacks);
-    }
     let mut immediate_results = Vec::new();
     let mut jobs = Vec::new();
     for &id in &trie[0].token_ids {
-        if let Some(stats) = stats {
-            TraversalStats::bump(&stats.valid_token_results);
-        }
         immediate_results.push(LocalTokenResult {
             token_id: id,
             stack_pairs: None,
@@ -3418,7 +2308,6 @@ fn compute_stack_in_out_for_trie(
             &mut root_stacks,
             &mut root_in_sets,
             &mut immediate_results,
-            0,
             traversal,
         );
         if let Some(advanced) = advanced {
@@ -3436,13 +2325,8 @@ fn compute_stack_in_out_for_trie(
                 &mut outputs,
             );
         } else {
-            collect_invalid_edge_terminals(
-                edge,
-                edge.token_offsets.len(),
-                &mut immediate_results,
-                stats,
-            );
-            collect_invalid_subtree(&trie, edge.child, &mut immediate_results, stats);
+            collect_invalid_edge_terminals(edge, edge.token_offsets.len(), &mut immediate_results);
+            collect_invalid_subtree(&trie, edge.child, &mut immediate_results);
         }
     }
     if let Some(pb) = pb {
@@ -3461,7 +2345,6 @@ fn compute_stack_in_out_for_trie(
                 &mut job.stacks,
                 &mut in_sets,
                 &mut out,
-                job.depth,
             );
             if let Some(pb) = pb {
                 pb.inc(out.len() as u64);
@@ -3489,9 +2372,6 @@ fn compute_stack_in_out_for_trie(
         }));
     }
     results.sort_unstable_by_key(|result| result.token_id);
-    if let Some(stats) = stats {
-        stats.print(&trie_stats);
-    }
     TokenTraversalResults {
         stack_sets,
         tokens: results,
@@ -3589,11 +2469,6 @@ fn compute_token_classes(
             tasks.push((tok.clone(), *id));
         }
     }
-    let traversal_stats = args.debug_stats.then(TraversalStats::new);
-    if args.debug_stats {
-        print_grammar_debug_stats(&preterms_rev, &ig, n_symbols, &tasks);
-    }
-
     let pb = if !args.no_progress {
         let pb = ProgressBar::new(tasks.len() as u64);
         pb.set_style(progress_style(
@@ -3603,14 +2478,11 @@ fn compute_token_classes(
     } else {
         None
     };
-    let traversal_start = Instant::now();
-    let results = compute_stack_in_out_for_trie(&tasks, &ig, pb.as_ref(), traversal_stats.as_ref());
-    let traversal_elapsed = traversal_start.elapsed();
+    let results = compute_stack_in_out_for_trie(&tasks, &ig, pb.as_ref());
     if let Some(pb) = &pb {
         pb.finish();
     }
 
-    let bucketing_start = Instant::now();
     let bucket_pb = if !args.no_progress {
         let pb = ProgressBar::new(results.tokens.len() as u64);
         pb.set_style(progress_style(
@@ -3624,10 +2496,6 @@ fn compute_token_classes(
     let mut seq_ids: FastHashMap<(usize, usize), usize> = fast_hash_map();
     let mut classes: FastHashMap<Vec<usize>, Vec<usize>> = fast_hash_map();
     let mut invalid = Vec::new();
-    let mut bucket_stack_pairs = 0usize;
-    let mut max_bucket_stack_pairs = 0usize;
-    let mut max_bucket_token_id = None;
-    let mut max_bucket_shape = None;
     let TokenTraversalResults {
         stack_sets: traversal_stack_sets,
         tokens: traversal_tokens,
@@ -3645,18 +2513,6 @@ fn compute_token_classes(
     for result in traversal_tokens {
         if let Some(stack_pairs) = result.stack_pairs {
             let global_ids = &local_global_stack_ids[result.stack_set];
-            bucket_stack_pairs += stack_pairs.len();
-            if stack_pairs.len() > max_bucket_stack_pairs {
-                max_bucket_stack_pairs = stack_pairs.len();
-                max_bucket_token_id = Some(result.token_id);
-                if args.debug_stats {
-                    max_bucket_shape = Some(compute_bucket_pair_shape(
-                        result.token_id,
-                        &stack_pairs,
-                        &traversal_stack_sets[result.stack_set],
-                    ));
-                }
-            }
             let mut disp = Vec::with_capacity(stack_pairs.len());
             for (in_stack, out_stack) in stack_pairs {
                 let seq = (global_ids[in_stack], global_ids[out_stack]);
@@ -3704,65 +2560,11 @@ fn compute_token_classes(
         }
         reps[i] = best.cloned().unwrap_or_default();
     }
-    let bucketing_elapsed = bucketing_start.elapsed();
-    if args.debug_stats {
-        eprintln!("cfgzip debug stats: phases");
-        eprintln!(
-            "  traversal_s={:.6} bucketing_s={:.6} bucket_stack_pairs={} max_bucket_stack_pairs={} max_bucket_token_id={:?} global_stacks={} displacement_ids={} classes={}",
-            traversal_elapsed.as_secs_f64(),
-            bucketing_elapsed.as_secs_f64(),
-            bucket_stack_pairs,
-            max_bucket_stack_pairs,
-            max_bucket_token_id,
-            global_stack_ids.len(),
-            seq_ids.len(),
-            token_classes.len()
-        );
-        if let Some(id) = max_bucket_token_id {
-            if let Some(tok) = tokens
-                .iter()
-                .find_map(|(tok, tok_id)| (*tok_id == id).then_some(tok))
-            {
-                eprintln!("  max_bucket_token={}", debug_token_bytes(tok));
-            }
-        }
-        if let Some(shape) = &max_bucket_shape {
-            print_bucket_pair_shape("max_bucket_shape", shape);
-        }
-    }
     Ok(EquivOut {
         token_classes: vec_out,
         invalid_tokens: invalid,
         class_representatives: reps,
     })
-}
-
-fn print_bucket_pair_shape(label: &str, shape: &BucketPairShape) {
-    let density_den = shape
-        .unique_in_stacks
-        .saturating_mul(shape.unique_out_stacks)
-        .max(1);
-    eprintln!(
-        "  {label}: token_id={} pairs={} unique_pairs={} duplicate_pairs={} unique_in_stacks={} unique_out_stacks={} density={:.6}",
-                shape.token_id,
-                shape.pairs,
-                shape.unique_pairs,
-                shape.pairs.saturating_sub(shape.unique_pairs),
-                shape.unique_in_stacks,
-                shape.unique_out_stacks,
-                shape.unique_pairs as f64 / density_den as f64
-            );
-    eprintln!(
-                "  max_bucket_stack_lens: in_min={} in_median={} in_max={} out_min={} out_median={} out_max={}",
-                shape.min_in_stack_len,
-                shape.median_in_stack_len,
-                shape.max_in_stack_len,
-                shape.min_out_stack_len,
-                shape.median_out_stack_len,
-                shape.max_out_stack_len
-            );
-    eprintln!("  {label}_top_out_counts: {:?}", shape.top_out_counts);
-    eprintln!("  {label}_top_in_counts: {:?}", shape.top_in_counts);
 }
 
 fn write_output(path: &Path, eq: &EquivOut, show_progress: bool) -> Result<()> {
@@ -3931,7 +2733,6 @@ mod tests {
             hf_token: None,
             cache_dir: None,
             no_progress: true,
-            debug_stats: false,
         }
     }
 
@@ -4334,7 +3135,7 @@ mod tests {
 
     fn assert_trie_matches_reference(grammar: &str, tokens: Vec<(Vec<u8>, usize)>) {
         let (raw, optimized) = test_int_grammars(grammar, &tokens);
-        let optimized = compute_stack_in_out_for_trie(&tokens, &optimized, None, None);
+        let optimized = compute_stack_in_out_for_trie(&tokens, &optimized, None);
         assert_eq!(
             materialized_token_results(&optimized),
             reference_token_results(&tokens, &raw)
@@ -4827,7 +3628,7 @@ mod tests {
         assert_eq!(trie_token_ids_at(&trie, b"ba"), vec![15]);
 
         let mut invalid = Vec::new();
-        collect_invalid_subtree(&trie, 0, &mut invalid, None);
+        collect_invalid_subtree(&trie, 0, &mut invalid);
         invalid.sort_unstable_by_key(|result| result.token_id);
         assert_eq!(
             invalid
@@ -4882,15 +3683,13 @@ mod tests {
         let mut reference_sets = InStackSetInterner::new();
         let mut reference =
             factor_frontier(&reference_initial, &reference_stacks, &mut reference_sets);
-        for depth in 1..=5 {
+        for _ in 1..=5 {
             reference = advance_factored_frontier(
                 &reference,
                 b' ',
                 &ig,
                 &mut reference_stacks,
                 &mut reference_sets,
-                depth,
-                None,
             );
         }
 
@@ -4901,7 +3700,6 @@ mod tests {
             nodes: &[],
             subtree_token_counts: &[],
             ig: &ig,
-            stats: None,
         };
         let first = advance_run(
             &run_frontier,
@@ -4909,7 +3707,6 @@ mod tests {
             5,
             &mut run_stacks,
             &mut run_sets,
-            0,
             traversal,
         );
         let second = advance_run(
@@ -4918,7 +3715,6 @@ mod tests {
             5,
             &mut run_stacks,
             &mut run_sets,
-            0,
             traversal,
         );
 
@@ -4930,45 +3726,6 @@ mod tests {
             materialized_factored_frontier(&second, &run_stacks, &mut run_sets),
             materialized_factored_frontier(&reference, &reference_stacks, &mut reference_sets)
         );
-    }
-
-    #[test]
-    fn cached_run_trie_traversal_matches_with_and_without_debug_stats() {
-        let tokens = vec![
-            tok(" ", 0),
-            tok("  ", 1),
-            tok("     ", 2),
-            tok("          ", 3),
-            tok("          x", 4),
-            tok("x", 5),
-            tok("<", 6),
-            tok("</", 7),
-            tok("<a", 8),
-        ];
-        let (_, ig) = test_int_grammars(
-            r#"
-                root ::= element | spaces "x"
-                element ::= "<" name attrs ">" "</" name ">"
-                attrs ::= "" | " " name "=" quote value quote attrs
-                spaces ::= "" | " " spaces
-                name ::= [A-Za-z_:] [A-Za-z0-9_.:-]*
-                value ::= [^"<&]*
-                quote ::= "\""
-            "#,
-            &tokens,
-        );
-
-        let cached =
-            materialized_token_results(&compute_stack_in_out_for_trie(&tokens, &ig, None, None));
-        let stats = TraversalStats::new();
-        let byte_by_byte = materialized_token_results(&compute_stack_in_out_for_trie(
-            &tokens,
-            &ig,
-            None,
-            Some(&stats),
-        ));
-        assert_eq!(cached, byte_by_byte);
-        assert!(stats.run_edges.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
@@ -5001,12 +3758,12 @@ mod tests {
         assert_eq!(sets.intern_vec(vec![a, b]), ab);
 
         let c_set = sets.singleton(c);
-        let abc = sets.union(ab, c_set, None);
-        assert_eq!(sets.union(c_set, ab, None), abc);
+        let abc = sets.union(ab, c_set);
+        assert_eq!(sets.union(c_set, ab), abc);
         assert_eq!(sets.members_vec(abc), vec![a, b, c]);
 
-        let pushed = sets.push_all(abc, 9, &mut stacks, None);
-        assert_eq!(sets.push_all(abc, 9, &mut stacks, None), pushed);
+        let pushed = sets.push_all(abc, 9, &mut stacks);
+        assert_eq!(sets.push_all(abc, 9, &mut stacks), pushed);
         let materialized = sets
             .members_vec(pushed)
             .into_iter()
@@ -5149,15 +3906,13 @@ mod tests {
             factor_frontier(&factored_initial, &factored_stacks, &mut factored_in_sets);
 
         for &byte in b"<a name=\"value\">text" {
-            flat_frontier = advance_frontier(&flat_frontier, byte, &ig, &mut flat_stacks, 0, None);
+            flat_frontier = advance_frontier(&flat_frontier, byte, &ig, &mut flat_stacks);
             factored_frontier = advance_factored_frontier(
                 &factored_frontier,
                 byte,
                 &ig,
                 &mut factored_stacks,
                 &mut factored_in_sets,
-                0,
-                None,
             );
             assert_eq!(
                 materialized_factored_frontier(
@@ -5222,9 +3977,8 @@ mod tests {
             "#,
             &tokens,
         );
-        let optimized = materialized_token_results(&compute_stack_in_out_for_trie(
-            &tokens, &optimized, None, None,
-        ));
+        let optimized =
+            materialized_token_results(&compute_stack_in_out_for_trie(&tokens, &optimized, None));
         let uncanonicalized_reference = tokens
             .iter()
             .map(|(token, id)| {
@@ -5351,11 +4105,10 @@ mod tests {
         reversed.reverse();
 
         let (_, ig) = test_int_grammars(grammar, &tokens);
-        let first =
-            materialized_token_results(&compute_stack_in_out_for_trie(&tokens, &ig, None, None));
+        let first = materialized_token_results(&compute_stack_in_out_for_trie(&tokens, &ig, None));
         let (_, ig) = test_int_grammars(grammar, &reversed);
         let second =
-            materialized_token_results(&compute_stack_in_out_for_trie(&reversed, &ig, None, None));
+            materialized_token_results(&compute_stack_in_out_for_trie(&reversed, &ig, None));
         assert_eq!(first, second);
     }
 
@@ -5487,14 +4240,8 @@ mod tests {
         for &byte in b"aabc" {
             reference_frontier =
                 advance_frontier_reference(&reference_frontier, byte, &raw, &mut reference_stacks);
-            optimized_frontier = advance_frontier(
-                &optimized_frontier,
-                byte,
-                &optimized,
-                &mut optimized_stacks,
-                0,
-                None,
-            );
+            optimized_frontier =
+                advance_frontier(&optimized_frontier, byte, &optimized, &mut optimized_stacks);
             assert_eq!(
                 materialized_frontier(&optimized_frontier, &optimized_stacks),
                 materialized_frontier(&reference_frontier, &reference_stacks),
@@ -5561,7 +4308,7 @@ mod tests {
         .collect::<Frontier>();
 
         let reference = advance_frontier_reference(&frontier, b'x', &raw, &mut reference_stacks);
-        let got = advance_frontier(&frontier, b'x', &optimized, &mut optimized_stacks, 0, None);
+        let got = advance_frontier(&frontier, b'x', &optimized, &mut optimized_stacks);
         assert_eq!(
             materialized_frontier(&got, &optimized_stacks),
             materialized_frontier(&reference, &reference_stacks)
@@ -5624,7 +4371,7 @@ mod tests {
             start: 0,
         };
         let tasks = vec![(vec![b'a'], 10), (vec![b'a', b'a'], 11), (vec![b'b'], 12)];
-        let traversal = compute_stack_in_out_for_trie(&tasks, &ig, None, None);
+        let traversal = compute_stack_in_out_for_trie(&tasks, &ig, None);
         let got = materialized_token_results(&traversal);
 
         let one_a = HashSet::from([(vec![0], Vec::new()), (vec![0], vec![0])]);
