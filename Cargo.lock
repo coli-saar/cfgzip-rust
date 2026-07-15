@@ -181,7 +181,6 @@ dependencies = [
  "rayon",
  "regex",
  "regex-automata",
- "serde",
  "serde-pickle",
  "serde_bytes",
  "serde_json",
