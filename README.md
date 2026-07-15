@@ -105,8 +105,12 @@ Useful options:
 - `--n-logits`: override the output logit vocabulary size.
 - `--ignore-range START..END`: exclude token ids, useful for special tokens.
 - `--skip-null-bytes`: put tokens containing `\x00` in singleton classes.
-- `--skip-repeat-bytes`: put tokens with repeated `***`, `+++`, or `---` bytes
-  in singleton classes.
+- `--skip-repeat-bytes`: put tokens containing a repeated decoded-byte run in
+  singleton classes instead of processing them through the grammar. This is a
+  conservative preprocessing/runtime tradeoff for low-entropy tokenizer tokens
+  such as long runs of spaces.
+- `--skip-repeat-min-run`: minimum repeated-byte run length for
+  `--skip-repeat-bytes`, default `4`.
 - `--num-threads`: Rayon worker count for token traversal.
 - `--cache-dir`: HuggingFace asset cache directory.
 
@@ -187,6 +191,36 @@ rm -rf /tmp/cfgzip_llama_cpp_rust
   --skip-repeat-bytes \
   --num-threads 16
 ```
+
+## Runtime And Class Counts
+
+The following measurements use the
+`meta-llama/Llama-3.2-3B-Instruct` tokenizer. Its logit vocabulary has
+**128,256 token ids**. The reported class count is the number of compressed
+CFGzip token classes produced by the Rust preprocessor.
+
+Experiment setup:
+
+- Hardware: MacBook Pro, Apple M4 Pro, 14 cores (10 performance, 4 efficiency),
+  24 GB memory.
+- OS: macOS 15.6.1.
+- Build: `cargo build --release`.
+- Threads: measured with both `--num-threads 16` and `--num-threads 1`.
+- Repeated-token policy: `--skip-repeat-bytes --skip-repeat-min-run 4`.
+- Timing: `/usr/bin/time -p`; the table reports `real` wall-clock seconds.
+- C++ run also uses `--ignore-range 128000..128255`, matching the paper
+  benchmark command above.
+
+| Grammar  | 16 threads | Single CPU core | Classes |
+|---|---:|---:|---:|
+| C++  | 1.38s | 3.21s | 3,830 |
+| bython  | 1.00s | 1.69s | 2,498 |
+| XML  | 0.72s | 1.17s | 2,262 |
+
+The `--skip-repeat-bytes` option keeps complicated repeated-byte tokens as
+singleton classes. This slightly increases the compressed class vocabulary, but
+it avoids expensive exact preprocessing for rare tokenizer tokens such as long
+space runs.
 
 ## Grammar Format
 

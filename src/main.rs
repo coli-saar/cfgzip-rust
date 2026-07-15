@@ -21,7 +21,6 @@ type Preterms = BTreeMap<Symbol, BTreeSet<u8>>;
 type FastHashMap<K, V> = HashMap<K, V, AHashRandomState>;
 type FastHashSet<T> = HashSet<T, AHashRandomState>;
 const STATS_DEPTH_BUCKETS: usize = 64;
-
 fn fast_hash_map<K, V>() -> FastHashMap<K, V> {
     HashMap::with_hasher(AHashRandomState::new())
 }
@@ -50,6 +49,8 @@ struct Args {
     skip_null_bytes: bool,
     #[arg(long, default_value_t = false)]
     skip_repeat_bytes: bool,
+    #[arg(long, default_value_t = 4)]
+    skip_repeat_min_run: usize,
     #[arg(long, default_value_t = 1)]
     num_threads: usize,
     #[arg(long, env = "HF_TOKEN")]
@@ -1250,6 +1251,22 @@ struct EquivOut {
     class_representatives: Vec<Vec<u8>>,
 }
 
+struct BucketPairShape {
+    token_id: usize,
+    pairs: usize,
+    unique_pairs: usize,
+    unique_in_stacks: usize,
+    unique_out_stacks: usize,
+    min_in_stack_len: usize,
+    median_in_stack_len: usize,
+    max_in_stack_len: usize,
+    min_out_stack_len: usize,
+    median_out_stack_len: usize,
+    max_out_stack_len: usize,
+    top_out_counts: Vec<(usize, usize, usize)>,
+    top_in_counts: Vec<(usize, usize, usize)>,
+}
+
 #[derive(Clone)]
 struct IntGrammar {
     scan_transitions: [FastHashMap<usize, Vec<Vec<usize>>>; 256],
@@ -1280,7 +1297,7 @@ struct ControlKey {
     allow_bt: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FactoredState {
     control: ControlKey,
     in_stack_set: usize,
@@ -1307,8 +1324,15 @@ struct InStackSetInterner {
 
 #[derive(Default)]
 struct TokenTrieNode {
-    children: BTreeMap<u8, usize>,
+    children: BTreeMap<u8, TokenTrieEdge>,
     token_ids: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct TokenTrieEdge {
+    label: Vec<u8>,
+    token_offsets: Vec<(usize, Vec<usize>)>,
+    child: usize,
 }
 
 struct TrieJob {
@@ -1337,6 +1361,8 @@ struct TokenTraversalResults {
 
 #[derive(Default)]
 struct TokenTrieStats {
+    raw_nodes: usize,
+    raw_edges: usize,
     nodes: usize,
     edges: usize,
     leaves: usize,
@@ -1344,6 +1370,10 @@ struct TokenTrieStats {
     max_depth: usize,
     max_children: usize,
     max_tokens_at_node: usize,
+    max_edge_label_len: usize,
+    homogeneous_edges: usize,
+    max_homogeneous_run_len: usize,
+    homogeneous_run_cache_candidate_edges: usize,
 }
 
 #[derive(Default)]
@@ -1400,6 +1430,19 @@ struct TraversalStats {
     rebase_factored_groups: AtomicU64,
     rebase_in_set_members: AtomicU64,
     max_factored_groups: AtomicU64,
+    label_edges: AtomicU64,
+    label_bytes: AtomicU64,
+    homogeneous_label_edges: AtomicU64,
+    max_label_len: AtomicU64,
+    max_homogeneous_label_len: AtomicU64,
+    run_edges: AtomicU64,
+    max_run_output_states: AtomicU64,
+    max_run_materialized_states: AtomicU64,
+    max_run_byte: AtomicU64,
+    max_run_len: AtomicU64,
+    max_materialized_run_states: AtomicU64,
+    max_materialized_run_byte: AtomicU64,
+    max_materialized_run_len: AtomicU64,
     depth_advances: Vec<AtomicU64>,
     depth_candidate_states: Vec<AtomicU64>,
     depth_output_states: Vec<AtomicU64>,
@@ -1452,6 +1495,19 @@ impl TraversalStats {
             rebase_factored_groups: AtomicU64::new(0),
             rebase_in_set_members: AtomicU64::new(0),
             max_factored_groups: AtomicU64::new(0),
+            label_edges: AtomicU64::new(0),
+            label_bytes: AtomicU64::new(0),
+            homogeneous_label_edges: AtomicU64::new(0),
+            max_label_len: AtomicU64::new(0),
+            max_homogeneous_label_len: AtomicU64::new(0),
+            run_edges: AtomicU64::new(0),
+            max_run_output_states: AtomicU64::new(0),
+            max_run_materialized_states: AtomicU64::new(0),
+            max_run_byte: AtomicU64::new(0),
+            max_run_len: AtomicU64::new(0),
+            max_materialized_run_states: AtomicU64::new(0),
+            max_materialized_run_byte: AtomicU64::new(0),
+            max_materialized_run_len: AtomicU64::new(0),
             depth_advances: (0..STATS_DEPTH_BUCKETS)
                 .map(|_| AtomicU64::new(0))
                 .collect(),
@@ -1587,13 +1643,67 @@ impl TraversalStats {
         Self::add(&self.rebase_in_set_members, members);
     }
 
+    fn observe_label(&self, label: &[u8]) {
+        Self::bump(&self.label_edges);
+        Self::add(&self.label_bytes, label.len());
+        Self::max(&self.max_label_len, label.len());
+        if is_homogeneous(label) {
+            Self::bump(&self.homogeneous_label_edges);
+            Self::max(&self.max_homogeneous_label_len, label.len());
+        }
+    }
+
+    fn observe_run(&self, byte: u8, len: usize, output_states: usize, materialized_states: usize) {
+        Self::bump(&self.run_edges);
+        let output = output_states as u64;
+        let mut current = self.max_run_output_states.load(Ordering::Relaxed);
+        while output > current {
+            match self.max_run_output_states.compare_exchange_weak(
+                current,
+                output,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.max_run_byte.store(byte as u64, Ordering::Relaxed);
+                    self.max_run_len.store(len as u64, Ordering::Relaxed);
+                    self.max_run_materialized_states
+                        .store(materialized_states as u64, Ordering::Relaxed);
+                    break;
+                }
+                Err(next) => current = next,
+            }
+        }
+        let materialized = materialized_states as u64;
+        let mut current = self.max_materialized_run_states.load(Ordering::Relaxed);
+        while materialized > current {
+            match self.max_materialized_run_states.compare_exchange_weak(
+                current,
+                materialized,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.max_materialized_run_byte
+                        .store(byte as u64, Ordering::Relaxed);
+                    self.max_materialized_run_len
+                        .store(len as u64, Ordering::Relaxed);
+                    break;
+                }
+                Err(next) => current = next,
+            }
+        }
+    }
+
     fn print(&self, trie: &TokenTrieStats) {
         let advances = self.advances.load(Ordering::Relaxed).max(1);
         let candidate_states = self.candidate_states.load(Ordering::Relaxed);
         let output_states = self.output_states.load(Ordering::Relaxed);
         eprintln!("cfgzip debug stats: traversal");
         eprintln!(
-            "  trie: nodes={} edges={} leaves={} tokens={} max_depth={} max_children={} max_tokens_at_node={}",
+            "  trie: raw_nodes={} raw_edges={} nodes={} edges={} leaves={} tokens={} max_depth={} max_children={} max_tokens_at_node={}",
+            trie.raw_nodes,
+            trie.raw_edges,
             trie.nodes,
             trie.edges,
             trie.leaves,
@@ -1601,6 +1711,14 @@ impl TraversalStats {
             trie.max_depth,
             trie.max_children,
             trie.max_tokens_at_node
+        );
+        eprintln!(
+            "  compressed trie: longest_edge_label={} homogeneous_edges={} max_homogeneous_run_len={} homogeneous_run_cache_candidate_edges={} edge_ratio={:.2}",
+            trie.max_edge_label_len,
+            trie.homogeneous_edges,
+            trie.max_homogeneous_run_len,
+            trie.homogeneous_run_cache_candidate_edges,
+            trie.raw_edges as f64 / trie.edges.max(1) as f64
         );
         eprintln!(
             "  advances={} input_states={} empty_out_inputs={} nonempty_out_inputs={}",
@@ -1686,6 +1804,22 @@ impl TraversalStats {
             self.in_set_push_all_hits.load(Ordering::Relaxed),
             self.in_set_push_all_input_members.load(Ordering::Relaxed),
             self.in_set_push_all_output_members.load(Ordering::Relaxed)
+        );
+        eprintln!(
+            "  label/run work: labels={} label_bytes={} homogeneous_labels={} max_label_len={} max_homogeneous_label_len={} runs={} max_run_output_states={} max_run_materialized_states={} max_run_byte={} max_run_len={} max_materialized_run_states={} max_materialized_run_byte={} max_materialized_run_len={}",
+            self.label_edges.load(Ordering::Relaxed),
+            self.label_bytes.load(Ordering::Relaxed),
+            self.homogeneous_label_edges.load(Ordering::Relaxed),
+            self.max_label_len.load(Ordering::Relaxed),
+            self.max_homogeneous_label_len.load(Ordering::Relaxed),
+            self.run_edges.load(Ordering::Relaxed),
+            self.max_run_output_states.load(Ordering::Relaxed),
+            self.max_run_materialized_states.load(Ordering::Relaxed),
+            self.max_run_byte.load(Ordering::Relaxed),
+            self.max_run_len.load(Ordering::Relaxed),
+            self.max_materialized_run_states.load(Ordering::Relaxed),
+            self.max_materialized_run_byte.load(Ordering::Relaxed),
+            self.max_materialized_run_len.load(Ordering::Relaxed)
         );
         eprintln!(
             "  depth buckets with work: depth advances candidates outputs max_output_frontier"
@@ -1911,6 +2045,19 @@ fn merge_sorted_unique(left: &[usize], right: &[usize]) -> Vec<usize> {
     out
 }
 
+fn is_homogeneous(bytes: &[u8]) -> bool {
+    bytes
+        .first()
+        .map_or(false, |first| bytes.iter().all(|byte| byte == first))
+}
+
+fn has_repeated_byte_run(bytes: &[u8], min_run: usize) -> bool {
+    min_run > 0
+        && bytes
+            .windows(min_run)
+            .any(|window| window.iter().all(|byte| *byte == window[0]))
+}
+
 fn canonical_search_state(mut state: SearchState, stacks: &StackInterner) -> SearchState {
     if !stacks.is_empty(state.out_stack) {
         state.prev_symbol = None;
@@ -2118,6 +2265,175 @@ fn intern_global_stack(
 fn debug_token_bytes(token: &[u8]) -> String {
     let escaped = String::from_utf8_lossy(token).escape_debug().to_string();
     format!("{escaped:?} bytes={token:?}")
+}
+
+fn compute_bucket_pair_shape(
+    token_id: usize,
+    stack_pairs: &[(usize, usize)],
+    stacks: &StackInterner,
+) -> BucketPairShape {
+    let mut unique_pairs = fast_hash_set();
+    let mut in_counts: FastHashMap<usize, usize> = fast_hash_map();
+    let mut out_counts: FastHashMap<usize, usize> = fast_hash_map();
+    for &(in_stack, out_stack) in stack_pairs {
+        unique_pairs.insert((in_stack, out_stack));
+        *in_counts.entry(in_stack).or_default() += 1;
+        *out_counts.entry(out_stack).or_default() += 1;
+    }
+
+    fn len_summary(
+        ids: impl Iterator<Item = usize>,
+        stacks: &StackInterner,
+    ) -> (usize, usize, usize) {
+        let mut lens = ids
+            .map(|stack_id| stacks.stacks[stack_id].len())
+            .collect::<Vec<_>>();
+        if lens.is_empty() {
+            return (0, 0, 0);
+        }
+        lens.sort_unstable();
+        (lens[0], lens[lens.len() / 2], lens[lens.len() - 1])
+    }
+
+    fn top_counts(
+        counts: &FastHashMap<usize, usize>,
+        stacks: &StackInterner,
+    ) -> Vec<(usize, usize, usize)> {
+        let mut top = counts
+            .iter()
+            .map(|(&stack_id, &count)| (count, stack_id, stacks.stacks[stack_id].len()))
+            .collect::<Vec<_>>();
+        top.sort_unstable_by(|a, b| b.cmp(a));
+        top.truncate(8);
+        top
+    }
+
+    let (min_in_stack_len, median_in_stack_len, max_in_stack_len) =
+        len_summary(in_counts.keys().copied(), stacks);
+    let (min_out_stack_len, median_out_stack_len, max_out_stack_len) =
+        len_summary(out_counts.keys().copied(), stacks);
+    let top_out_counts = top_counts(&out_counts, stacks);
+    let top_in_counts = top_counts(&in_counts, stacks);
+
+    BucketPairShape {
+        token_id,
+        pairs: stack_pairs.len(),
+        unique_pairs: unique_pairs.len(),
+        unique_in_stacks: in_counts.len(),
+        unique_out_stacks: out_counts.len(),
+        min_in_stack_len,
+        median_in_stack_len,
+        max_in_stack_len,
+        min_out_stack_len,
+        median_out_stack_len,
+        max_out_stack_len,
+        top_out_counts,
+        top_in_counts,
+    }
+}
+
+fn dump_bucket_pair_relation(
+    token_id: usize,
+    stack_pairs: &[(usize, usize)],
+    stacks: &StackInterner,
+) -> Result<()> {
+    let pair_path = format!("/tmp/cfgzip_token_{token_id}_pairs.tsv");
+    let stack_path = format!("/tmp/cfgzip_token_{token_id}_stacks.tsv");
+
+    let mut used_stacks = fast_hash_set();
+    for &(in_stack, out_stack) in stack_pairs {
+        used_stacks.insert(in_stack);
+        used_stacks.insert(out_stack);
+    }
+    let mut used_stacks = used_stacks.into_iter().collect::<Vec<_>>();
+    used_stacks.sort_unstable();
+
+    let mut pair_file = BufWriter::new(File::create(&pair_path)?);
+    writeln!(pair_file, "in_stack\tout_stack")?;
+    for &(in_stack, out_stack) in stack_pairs {
+        writeln!(pair_file, "{in_stack}\t{out_stack}")?;
+    }
+
+    let mut stack_file = BufWriter::new(File::create(&stack_path)?);
+    writeln!(stack_file, "stack_id\tlen\tsymbols")?;
+    for stack_id in used_stacks {
+        let stack = &stacks.stacks[stack_id];
+        write!(stack_file, "{stack_id}\t{}\t", stack.len())?;
+        for (idx, sym) in stack.iter().enumerate() {
+            if idx != 0 {
+                write!(stack_file, ",")?;
+            }
+            write!(stack_file, "{sym}")?;
+        }
+        writeln!(stack_file)?;
+    }
+
+    eprintln!(
+        "  token_{token_id}_dump: pairs_path={} stacks_path={} pairs={} referenced_stacks={}",
+        pair_path,
+        stack_path,
+        stack_pairs.len(),
+        stacks.stacks.len()
+    );
+    Ok(())
+}
+
+fn print_frontier_summary_for_token_trace(
+    label: &str,
+    frontier: &[FactoredState],
+    stacks: &StackInterner,
+    in_sets: &InStackSetInterner,
+) {
+    let mut out_totals: FastHashMap<usize, usize> = fast_hash_map();
+    let mut top_controls = frontier
+        .iter()
+        .map(|state| {
+            let count = in_sets.len(state.in_stack_set);
+            *out_totals.entry(state.control.out_stack).or_default() += count;
+            (
+                count,
+                state.control.out_stack,
+                stacks.stacks[state.control.out_stack].len(),
+                state.control.prev_symbol,
+                state.control.allow_bt,
+            )
+        })
+        .collect::<Vec<_>>();
+    top_controls.sort_unstable_by(|a, b| b.cmp(a));
+    top_controls.truncate(6);
+
+    let mut top_outs = out_totals
+        .into_iter()
+        .map(|(out_stack, count)| (count, out_stack, stacks.stacks[out_stack].len()))
+        .collect::<Vec<_>>();
+    let unique_out_stacks = top_outs.len();
+    top_outs.sort_unstable_by(|a, b| b.cmp(a));
+    top_outs.truncate(6);
+
+    eprintln!(
+        "  token_1961_trace {label}: groups={} materialized_in_members={} unique_out_stacks={} max_in_set={} top_outs={:?} top_controls={:?}",
+        frontier.len(),
+        factored_materialized_len(frontier, in_sets),
+        unique_out_stacks,
+        frontier
+            .iter()
+            .map(|state| in_sets.len(state.in_stack_set))
+            .max()
+            .unwrap_or(0),
+        top_outs,
+        top_controls
+    );
+}
+
+fn unique_in_stacks_for_frontier(
+    frontier: &[FactoredState],
+    in_sets: &InStackSetInterner,
+) -> FastHashSet<usize> {
+    let mut out = fast_hash_set();
+    for state in frontier {
+        out.extend(in_sets.sets[state.in_stack_set].iter().copied());
+    }
+    out
 }
 
 fn compute_stack_adj(
@@ -2395,8 +2711,14 @@ fn print_grammar_debug_stats(
     }
 }
 
-fn build_token_trie(tasks: &[(Vec<u8>, usize)]) -> Vec<TokenTrieNode> {
-    let mut nodes = vec![TokenTrieNode::default()];
+#[derive(Default)]
+struct RawTokenTrieNode {
+    children: BTreeMap<u8, usize>,
+    token_ids: Vec<usize>,
+}
+
+fn build_raw_token_trie(tasks: &[(Vec<u8>, usize)]) -> Vec<RawTokenTrieNode> {
+    let mut nodes = vec![RawTokenTrieNode::default()];
     for (tok, id) in tasks {
         let mut node = 0usize;
         for &b in tok {
@@ -2404,7 +2726,7 @@ fn build_token_trie(tasks: &[(Vec<u8>, usize)]) -> Vec<TokenTrieNode> {
                 node = next;
             } else {
                 let next = nodes.len();
-                nodes.push(TokenTrieNode::default());
+                nodes.push(RawTokenTrieNode::default());
                 nodes[node].children.insert(b, next);
                 node = next;
             }
@@ -2412,6 +2734,50 @@ fn build_token_trie(tasks: &[(Vec<u8>, usize)]) -> Vec<TokenTrieNode> {
         nodes[node].token_ids.push(*id);
     }
     nodes
+}
+
+fn build_token_trie(tasks: &[(Vec<u8>, usize)]) -> Vec<TokenTrieNode> {
+    fn compress_node(
+        raw: &[RawTokenTrieNode],
+        raw_id: usize,
+        out: &mut Vec<TokenTrieNode>,
+    ) -> usize {
+        let out_id = out.len();
+        out.push(TokenTrieNode {
+            children: BTreeMap::new(),
+            token_ids: raw[raw_id].token_ids.clone(),
+        });
+
+        for (&byte, &child_id) in &raw[raw_id].children {
+            let mut label = vec![byte];
+            let mut cursor = child_id;
+            let mut token_offsets = Vec::new();
+            while raw[cursor].children.len() == 1 {
+                if !raw[cursor].token_ids.is_empty() {
+                    token_offsets.push((label.len(), raw[cursor].token_ids.clone()));
+                }
+                let (&next_byte, &next_id) = raw[cursor].children.iter().next().unwrap();
+                label.push(next_byte);
+                cursor = next_id;
+            }
+            let compressed_child = compress_node(raw, cursor, out);
+            out[out_id].children.insert(
+                label[0],
+                TokenTrieEdge {
+                    label,
+                    token_offsets,
+                    child: compressed_child,
+                },
+            );
+        }
+
+        out_id
+    }
+
+    let raw = build_raw_token_trie(tasks);
+    let mut out = Vec::new();
+    compress_node(&raw, 0, &mut out);
+    out
 }
 
 fn compute_sequence_trie_stats<I, F>(tasks: &[(Vec<u8>, usize)], mut keys: F) -> TokenTrieStats
@@ -2463,7 +2829,13 @@ where
 }
 
 fn compute_token_trie_stats(nodes: &[TokenTrieNode]) -> TokenTrieStats {
-    fn rec(nodes: &[TokenTrieNode], node_id: usize, depth: usize, stats: &mut TokenTrieStats) {
+    fn rec(
+        nodes: &[TokenTrieNode],
+        node_id: usize,
+        depth: usize,
+        stats: &mut TokenTrieStats,
+        homogeneous_runs: &mut FastHashMap<(u8, usize), usize>,
+    ) {
         let node = &nodes[node_id];
         stats.nodes += 1;
         stats.edges += node.children.len();
@@ -2474,13 +2846,40 @@ fn compute_token_trie_stats(nodes: &[TokenTrieNode]) -> TokenTrieStats {
         if !node.token_ids.is_empty() {
             stats.leaves += 1;
         }
-        for &child_id in node.children.values() {
-            rec(nodes, child_id, depth + 1, stats);
+        for edge in node.children.values() {
+            stats.raw_edges += edge.label.len();
+            stats.max_edge_label_len = stats.max_edge_label_len.max(edge.label.len());
+            for (offset, token_ids) in &edge.token_offsets {
+                stats.tokens += token_ids.len();
+                stats.leaves += 1;
+                stats.max_depth = stats.max_depth.max(depth + *offset);
+                stats.max_tokens_at_node = stats.max_tokens_at_node.max(token_ids.len());
+            }
+            if is_homogeneous(&edge.label) {
+                stats.homogeneous_edges += 1;
+                stats.max_homogeneous_run_len = stats.max_homogeneous_run_len.max(edge.label.len());
+                *homogeneous_runs
+                    .entry((edge.label[0], edge.label.len()))
+                    .or_default() += 1;
+            }
+            rec(
+                nodes,
+                edge.child,
+                depth + edge.label.len(),
+                stats,
+                homogeneous_runs,
+            );
         }
     }
     let mut stats = TokenTrieStats::default();
     if !nodes.is_empty() {
-        rec(nodes, 0, 0, &mut stats);
+        let mut homogeneous_runs = fast_hash_map();
+        rec(nodes, 0, 0, &mut stats, &mut homogeneous_runs);
+        stats.raw_nodes = stats.raw_edges + 1;
+        stats.homogeneous_run_cache_candidate_edges = homogeneous_runs
+            .values()
+            .map(|count| count.saturating_sub(1))
+            .sum();
     }
     stats
 }
@@ -2489,8 +2888,13 @@ fn compute_subtree_token_counts(nodes: &[TokenTrieNode]) -> Vec<usize> {
     fn rec(nodes: &[TokenTrieNode], node_id: usize, counts: &mut [usize]) -> usize {
         let node = &nodes[node_id];
         let mut total = node.token_ids.len();
-        for &child_id in node.children.values() {
-            total += rec(nodes, child_id, counts);
+        for edge in node.children.values() {
+            total += edge
+                .token_offsets
+                .iter()
+                .map(|(_, token_ids)| token_ids.len())
+                .sum::<usize>();
+            total += rec(nodes, edge.child, counts);
         }
         counts[node_id] = total;
         total
@@ -2697,6 +3101,37 @@ fn advance_factored_frontier(
     next_states
 }
 
+fn advance_run(
+    frontier: &[FactoredState],
+    byte: u8,
+    len: usize,
+    ig: &IntGrammar,
+    stacks: &mut StackInterner,
+    in_sets: &mut InStackSetInterner,
+    depth: usize,
+    stats: Option<&TraversalStats>,
+) -> FactoredFrontier {
+    let mut current = frontier.to_vec();
+    let mut current_depth = depth;
+    for _ in 0..len {
+        current_depth += 1;
+        current =
+            advance_factored_frontier(&current, byte, ig, stacks, in_sets, current_depth, stats);
+        if current.is_empty() {
+            break;
+        }
+    }
+    if let Some(stats) = stats {
+        stats.observe_run(
+            byte,
+            len,
+            current.len(),
+            factored_materialized_len(&current, in_sets),
+        );
+    }
+    current
+}
+
 #[cfg(test)]
 fn frontier_stack_pairs(frontier: &[SearchState]) -> Option<Vec<(usize, usize)>> {
     let mut out = frontier
@@ -2730,6 +3165,184 @@ fn factored_frontier_stack_pairs(
     (!out.is_empty()).then_some(out)
 }
 
+fn push_valid_token_results(
+    ids: &[usize],
+    frontier: &[FactoredState],
+    in_sets: &mut InStackSetInterner,
+    out: &mut Vec<LocalTokenResult>,
+    stats: Option<&TraversalStats>,
+) {
+    let stack_pairs = factored_frontier_stack_pairs(frontier, in_sets, stats);
+    for &id in ids {
+        if let Some(stats) = stats {
+            TraversalStats::bump(&stats.valid_token_results);
+        }
+        out.push(LocalTokenResult {
+            token_id: id,
+            stack_pairs: stack_pairs.clone(),
+        });
+    }
+}
+
+fn push_invalid_token_results(
+    ids: &[usize],
+    out: &mut Vec<LocalTokenResult>,
+    stats: Option<&TraversalStats>,
+) {
+    for &id in ids {
+        if let Some(stats) = stats {
+            TraversalStats::bump(&stats.invalid_subtree_tokens);
+        }
+        out.push(LocalTokenResult {
+            token_id: id,
+            stack_pairs: None,
+        });
+    }
+}
+
+fn collect_invalid_edge_terminals(
+    edge: &TokenTrieEdge,
+    start_offset_index: usize,
+    out: &mut Vec<LocalTokenResult>,
+    stats: Option<&TraversalStats>,
+) {
+    for (_, ids) in edge.token_offsets.iter().skip(start_offset_index) {
+        push_invalid_token_results(ids, out, stats);
+    }
+}
+
+fn advance_edge_and_emit_terminals(
+    edge: &TokenTrieEdge,
+    frontier: &[FactoredState],
+    stacks: &mut StackInterner,
+    in_sets: &mut InStackSetInterner,
+    ig: &IntGrammar,
+    out: &mut Vec<LocalTokenResult>,
+    depth: usize,
+    stats: Option<&TraversalStats>,
+) -> Option<FactoredFrontier> {
+    if is_homogeneous(&edge.label) {
+        if let Some(stats) = stats {
+            stats.observe_label(&edge.label);
+        }
+        let trace_token_1961 = stats.is_some() && edge.label[0] == b' ' && edge.label.len() >= 20;
+        if trace_token_1961 {
+            eprintln!(
+                "  token_1961_trace edge_start: depth={} edge_len={} byte={} token_offsets={:?}",
+                depth,
+                edge.label.len(),
+                edge.label[0],
+                edge.token_offsets
+                    .iter()
+                    .map(|(offset, ids)| (*offset, ids.clone()))
+                    .collect::<Vec<_>>()
+            );
+            print_frontier_summary_for_token_trace("before_edge", frontier, stacks, in_sets);
+        }
+        let initial_trace_in_stacks =
+            trace_token_1961.then(|| unique_in_stacks_for_frontier(frontier, in_sets));
+        if edge.token_offsets.is_empty() && !trace_token_1961 {
+            return Some(advance_run(
+                frontier,
+                edge.label[0],
+                edge.label.len(),
+                ig,
+                stacks,
+                in_sets,
+                depth,
+                stats,
+            ));
+        }
+        let byte = edge.label[0];
+        let mut current = frontier.to_vec();
+        let mut offset_index = 0usize;
+        for offset in 1..=edge.label.len() {
+            current = advance_factored_frontier(
+                &current,
+                byte,
+                ig,
+                stacks,
+                in_sets,
+                depth + offset,
+                stats,
+            );
+            if current.is_empty() {
+                collect_invalid_edge_terminals(edge, offset_index, out, stats);
+                return None;
+            }
+            if trace_token_1961 {
+                let unique_in = unique_in_stacks_for_frontier(&current, in_sets).len();
+                print_frontier_summary_for_token_trace(
+                    &format!("after_offset_{}", offset),
+                    &current,
+                    stacks,
+                    in_sets,
+                );
+                eprintln!(
+                    "  token_1961_trace_unique after_offset_{}: unique_in_stacks={}",
+                    offset, unique_in
+                );
+            }
+            while offset_index < edge.token_offsets.len()
+                && edge.token_offsets[offset_index].0 == offset
+            {
+                let ids = &edge.token_offsets[offset_index].1;
+                push_valid_token_results(ids, &current, in_sets, out, stats);
+                offset_index += 1;
+            }
+        }
+        if let Some(stats) = stats {
+            stats.observe_run(
+                byte,
+                edge.label.len(),
+                current.len(),
+                factored_materialized_len(&current, in_sets),
+            );
+        }
+        if let Some(initial) = &initial_trace_in_stacks {
+            let final_in = unique_in_stacks_for_frontier(&current, in_sets);
+            let retained = final_in
+                .iter()
+                .filter(|stack_id| initial.contains(stack_id))
+                .count();
+            let generated = final_in.len().saturating_sub(retained);
+            eprintln!(
+                "  token_1961_trace_provenance: initial_unique_in={} final_unique_in={} retained_initial={} generated_during_space_run={} generated_fraction={:.6}",
+                initial.len(),
+                final_in.len(),
+                retained,
+                generated,
+                generated as f64 / final_in.len().max(1) as f64
+            );
+        }
+        return Some(current);
+    }
+
+    if let Some(stats) = stats {
+        stats.observe_label(&edge.label);
+    }
+    let mut current = frontier.to_vec();
+    let mut offset_index = 0usize;
+    for (byte_index, &byte) in edge.label.iter().enumerate() {
+        let offset = byte_index + 1;
+        current =
+            advance_factored_frontier(&current, byte, ig, stacks, in_sets, depth + offset, stats);
+        if current.is_empty() {
+            collect_invalid_edge_terminals(edge, offset_index, out, stats);
+            return None;
+        }
+        while offset_index < edge.token_offsets.len()
+            && edge.token_offsets[offset_index].0 == offset
+        {
+            let ids = &edge.token_offsets[offset_index].1;
+            push_valid_token_results(ids, &current, in_sets, out, stats);
+            offset_index += 1;
+        }
+    }
+
+    Some(current)
+}
+
 fn collect_token_trie_results(
     nodes: &[TokenTrieNode],
     node_id: usize,
@@ -2742,36 +3355,27 @@ fn collect_token_trie_results(
     stats: Option<&TraversalStats>,
 ) {
     let node = &nodes[node_id];
-    let stack_pairs = if node.token_ids.is_empty() {
-        None
-    } else {
-        factored_frontier_stack_pairs(frontier, in_sets, stats)
-    };
-    for &id in &node.token_ids {
-        if let Some(stats) = stats {
-            TraversalStats::bump(&stats.valid_token_results);
-        }
-        out.push(LocalTokenResult {
-            token_id: id,
-            stack_pairs: stack_pairs.clone(),
-        });
+    if !node.token_ids.is_empty() {
+        push_valid_token_results(&node.token_ids, frontier, in_sets, out, stats);
     }
-    for (&byte, &child_id) in &node.children {
-        let next = advance_factored_frontier(frontier, byte, ig, stacks, in_sets, depth + 1, stats);
-        if !next.is_empty() {
+    for edge in node.children.values() {
+        let next =
+            advance_edge_and_emit_terminals(edge, frontier, stacks, in_sets, ig, out, depth, stats);
+        if let Some(next) = next {
             collect_token_trie_results(
                 nodes,
-                child_id,
+                edge.child,
                 &next,
                 stacks,
                 in_sets,
                 ig,
                 out,
-                depth + 1,
+                depth + edge.label.len(),
                 stats,
             );
         } else {
-            collect_invalid_subtree(nodes, child_id, out, stats);
+            collect_invalid_edge_terminals(edge, edge.token_offsets.len(), out, stats);
+            collect_invalid_subtree(nodes, edge.child, out, stats);
         }
     }
 }
@@ -2783,17 +3387,10 @@ fn collect_invalid_subtree(
     stats: Option<&TraversalStats>,
 ) {
     let node = &nodes[node_id];
-    for &id in &node.token_ids {
-        if let Some(stats) = stats {
-            TraversalStats::bump(&stats.invalid_subtree_tokens);
-        }
-        out.push(LocalTokenResult {
-            token_id: id,
-            stack_pairs: None,
-        });
-    }
-    for &child_id in node.children.values() {
-        collect_invalid_subtree(nodes, child_id, out, stats);
+    push_invalid_token_results(&node.token_ids, out, stats);
+    for edge in node.children.values() {
+        collect_invalid_edge_terminals(edge, 0, out, stats);
+        collect_invalid_subtree(nodes, edge.child, out, stats);
     }
 }
 
@@ -2843,36 +3440,31 @@ fn collect_token_trie_jobs(
     }
 
     let node = &nodes[node_id];
-    let stack_pairs = factored_frontier_stack_pairs(&frontier, in_sets, stats);
-    for &id in &node.token_ids {
-        if let Some(stats) = stats {
-            TraversalStats::bump(&stats.valid_token_results);
-        }
-        immediate.push(LocalTokenResult {
-            token_id: id,
-            stack_pairs: stack_pairs.clone(),
-        });
+    if !node.token_ids.is_empty() {
+        push_valid_token_results(&node.token_ids, &frontier, in_sets, immediate, stats);
     }
 
-    for (&byte, &child_id) in &node.children {
-        let next =
-            advance_factored_frontier(&frontier, byte, ig, stacks, in_sets, depth + 1, stats);
-        if next.is_empty() {
-            collect_invalid_subtree(nodes, child_id, immediate, stats);
-        } else {
+    for edge in node.children.values() {
+        let next = advance_edge_and_emit_terminals(
+            edge, &frontier, stacks, in_sets, ig, immediate, depth, stats,
+        );
+        if let Some(next) = next {
             collect_token_trie_jobs(
                 nodes,
                 subtree_token_counts,
-                child_id,
+                edge.child,
                 next,
                 stacks,
                 in_sets,
-                depth + 1,
+                depth + edge.label.len(),
                 ig,
                 immediate,
                 jobs,
                 stats,
             );
+        } else {
+            collect_invalid_edge_terminals(edge, edge.token_offsets.len(), immediate, stats);
+            collect_invalid_subtree(nodes, edge.child, immediate, stats);
         }
     }
 }
@@ -2903,32 +3495,39 @@ fn compute_stack_in_out_for_trie(
             stack_pairs: None,
         });
     }
-    for (&byte, &child_id) in &trie[0].children {
-        let frontier = advance_factored_frontier(
+    for edge in trie[0].children.values() {
+        let advanced = advance_edge_and_emit_terminals(
+            edge,
             &root_frontier,
-            byte,
-            ig,
             &mut root_stacks,
             &mut root_in_sets,
-            1,
+            ig,
+            &mut immediate_results,
+            0,
             stats,
         );
-        if frontier.is_empty() {
-            collect_invalid_subtree(&trie, child_id, &mut immediate_results, stats);
-        } else {
+        if let Some(advanced) = advanced {
             collect_token_trie_jobs(
                 &trie,
                 &subtree_token_counts,
-                child_id,
-                frontier,
+                edge.child,
+                advanced,
                 &mut root_stacks,
                 &mut root_in_sets,
-                1,
+                edge.label.len(),
                 ig,
                 &mut immediate_results,
                 &mut jobs,
                 stats,
             );
+        } else {
+            collect_invalid_edge_terminals(
+                edge,
+                edge.token_offsets.len(),
+                &mut immediate_results,
+                stats,
+            );
+            collect_invalid_subtree(&trie, edge.child, &mut immediate_results, stats);
         }
     }
     if let Some(pb) = pb {
@@ -3061,10 +3660,7 @@ fn compute_token_classes(
     };
     let skip = |tok: &[u8]| {
         (args.skip_null_bytes && tok.contains(&0))
-            || (args.skip_repeat_bytes
-                && tok
-                    .windows(3)
-                    .any(|w| matches!(w, [42, 42, 42] | [43, 43, 43] | [45, 45, 45])))
+            || (args.skip_repeat_bytes && has_repeated_byte_run(tok, args.skip_repeat_min_run))
     };
     let mut tasks = Vec::new();
     let mut skip_classes = Vec::new();
@@ -3118,8 +3714,13 @@ fn compute_token_classes(
     let mut bucket_stack_pairs = 0usize;
     let mut max_bucket_stack_pairs = 0usize;
     let mut max_bucket_token_id = None;
-    let local_global_stack_ids = results
-        .stack_sets
+    let mut max_bucket_shape = None;
+    let mut token_1961_shape = None;
+    let TokenTraversalResults {
+        stack_sets: traversal_stack_sets,
+        tokens: traversal_tokens,
+    } = results;
+    let local_global_stack_ids = traversal_stack_sets
         .iter()
         .map(|stacks| {
             stacks
@@ -3129,13 +3730,32 @@ fn compute_token_classes(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    for result in results.tokens {
+    for result in traversal_tokens {
         if let Some(stack_pairs) = result.stack_pairs {
             let global_ids = &local_global_stack_ids[result.stack_set];
             bucket_stack_pairs += stack_pairs.len();
+            if args.debug_stats && result.token_id == 1961 {
+                token_1961_shape = Some(compute_bucket_pair_shape(
+                    result.token_id,
+                    &stack_pairs,
+                    &traversal_stack_sets[result.stack_set],
+                ));
+                dump_bucket_pair_relation(
+                    result.token_id,
+                    &stack_pairs,
+                    &traversal_stack_sets[result.stack_set],
+                )?;
+            }
             if stack_pairs.len() > max_bucket_stack_pairs {
                 max_bucket_stack_pairs = stack_pairs.len();
                 max_bucket_token_id = Some(result.token_id);
+                if args.debug_stats {
+                    max_bucket_shape = Some(compute_bucket_pair_shape(
+                        result.token_id,
+                        &stack_pairs,
+                        &traversal_stack_sets[result.stack_set],
+                    ));
+                }
             }
             let mut disp = Vec::with_capacity(stack_pairs.len());
             for (in_stack, out_stack) in stack_pairs {
@@ -3206,12 +3826,46 @@ fn compute_token_classes(
                 eprintln!("  max_bucket_token={}", debug_token_bytes(tok));
             }
         }
+        if let Some(shape) = &max_bucket_shape {
+            print_bucket_pair_shape("max_bucket_shape", shape);
+        }
+        if let Some(shape) = &token_1961_shape {
+            print_bucket_pair_shape("token_1961_shape", shape);
+        }
     }
     Ok(EquivOut {
         token_classes: vec_out,
         invalid_tokens: invalid,
         class_representatives: reps,
     })
+}
+
+fn print_bucket_pair_shape(label: &str, shape: &BucketPairShape) {
+    let density_den = shape
+        .unique_in_stacks
+        .saturating_mul(shape.unique_out_stacks)
+        .max(1);
+    eprintln!(
+        "  {label}: token_id={} pairs={} unique_pairs={} duplicate_pairs={} unique_in_stacks={} unique_out_stacks={} density={:.6}",
+                shape.token_id,
+                shape.pairs,
+                shape.unique_pairs,
+                shape.pairs.saturating_sub(shape.unique_pairs),
+                shape.unique_in_stacks,
+                shape.unique_out_stacks,
+                shape.unique_pairs as f64 / density_den as f64
+            );
+    eprintln!(
+                "  max_bucket_stack_lens: in_min={} in_median={} in_max={} out_min={} out_median={} out_max={}",
+                shape.min_in_stack_len,
+                shape.median_in_stack_len,
+                shape.max_in_stack_len,
+                shape.min_out_stack_len,
+                shape.median_out_stack_len,
+                shape.max_out_stack_len
+            );
+    eprintln!("  {label}_top_out_counts: {:?}", shape.top_out_counts);
+    eprintln!("  {label}_top_in_counts: {:?}", shape.top_in_counts);
 }
 
 fn write_output(path: &Path, eq: &EquivOut, show_progress: bool) -> Result<()> {
@@ -3375,6 +4029,7 @@ mod tests {
             ignore_range: Vec::new(),
             skip_null_bytes: false,
             skip_repeat_bytes: false,
+            skip_repeat_min_run: 4,
             num_threads: 1,
             hf_token: None,
             cache_dir: None,
@@ -3389,6 +4044,30 @@ mod tests {
 
     fn tok_bytes(bytes: &[u8], id: usize) -> (Vec<u8>, usize) {
         (bytes.to_vec(), id)
+    }
+
+    fn trie_token_ids_at(nodes: &[TokenTrieNode], bytes: &[u8]) -> Vec<usize> {
+        let mut node = 0;
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let edge = nodes[node]
+                .children
+                .get(&bytes[pos])
+                .expect("missing compressed trie edge");
+            let remaining = bytes.len() - pos;
+            let consumed = remaining.min(edge.label.len());
+            assert!(edge.label.starts_with(&bytes[pos..pos + consumed]));
+            if consumed < edge.label.len() {
+                return edge
+                    .token_offsets
+                    .iter()
+                    .find_map(|(offset, ids)| (*offset == consumed).then(|| ids.clone()))
+                    .unwrap_or_default();
+            }
+            pos += edge.label.len();
+            node = edge.child;
+        }
+        nodes[node].token_ids.clone()
     }
 
     fn classify(grammar: &str, tokens: Vec<(Vec<u8>, usize)>, eos: usize) -> EquivOut {
@@ -3442,6 +4121,26 @@ mod tests {
             "token {id} should be listed as invalid; invalid={:?}",
             eq.invalid_tokens
         );
+    }
+
+    fn assert_class_refinement(coarse: &EquivOut, fine: &EquivOut) {
+        let mut fine_to_coarse = HashMap::<i32, i32>::new();
+        for (token_id, (&coarse_class, &fine_class)) in coarse
+            .token_classes
+            .iter()
+            .zip(&fine.token_classes)
+            .enumerate()
+        {
+            if coarse_class < 0 || fine_class < 0 {
+                continue;
+            }
+            if let Some(previous) = fine_to_coarse.insert(fine_class, coarse_class) {
+                assert_eq!(
+                    previous, coarse_class,
+                    "fine class {fine_class} mixes old classes on token {token_id}"
+                );
+            }
+        }
     }
 
     struct RawIntGrammar {
@@ -4059,6 +4758,7 @@ mod tests {
         let mut args = test_args();
         args.skip_null_bytes = true;
         args.skip_repeat_bytes = true;
+        args.skip_repeat_min_run = 3;
         args.ignore_range = vec![(6, 7)];
         let eq = classify_with_args(
             r#"root ::= "a" | "\n" | "\t" | "\x00" | "***""#,
@@ -4071,6 +4771,8 @@ mod tests {
                 tok("b", 5),
                 tok("ignored", 6),
                 tok("<eos>", 7),
+                tok("   ", 8),
+                tok("aaa", 9),
             ],
             7,
             args,
@@ -4084,6 +4786,53 @@ mod tests {
         assert_eq!(class_of(&eq, 6), -1);
         assert!(!eq.invalid_tokens.contains(&6));
         assert_ne!(class_of(&eq, 3), class_of(&eq, 4));
+        assert_ne!(class_of(&eq, 4), class_of(&eq, 8));
+        assert_ne!(class_of(&eq, 4), class_of(&eq, 9));
+        assert_ne!(class_of(&eq, 8), class_of(&eq, 9));
+        assert!(!eq.invalid_tokens.contains(&8));
+        assert!(!eq.invalid_tokens.contains(&9));
+    }
+
+    #[test]
+    fn skip_repeat_bytes_refines_unskipped_classes() {
+        let tokens = vec![
+            tok("a", 0),
+            tok("b", 1),
+            tok("aaa", 2),
+            tok("   ", 3),
+            tok("aaab", 4),
+            tok("<eos>", 5),
+        ];
+        let old = classify(r#"root ::= [ab ]*"#, tokens.clone(), 5);
+
+        let mut args = test_args();
+        args.skip_repeat_bytes = true;
+        args.skip_repeat_min_run = 3;
+        let skipped = classify_with_args(r#"root ::= [ab ]*"#, tokens, 5, args);
+
+        assert_class_refinement(&old, &skipped);
+        assert_ne!(class_of(&skipped, 2), class_of(&skipped, 3));
+        assert_ne!(class_of(&skipped, 2), class_of(&skipped, 4));
+        assert_ne!(class_of(&skipped, 3), class_of(&skipped, 4));
+        assert!(!skipped.invalid_tokens.contains(&2));
+        assert!(!skipped.invalid_tokens.contains(&3));
+        assert!(!skipped.invalid_tokens.contains(&4));
+    }
+
+    #[test]
+    fn skip_repeat_min_run_controls_singleton_threshold() {
+        let tokens = vec![tok("a", 0), tok("aaa", 1), tok("aaaa", 2), tok("<eos>", 3)];
+        let old = classify(r#"root ::= "a"*"#, tokens.clone(), 3);
+
+        let mut args = test_args();
+        args.skip_repeat_bytes = true;
+        args.skip_repeat_min_run = 4;
+        let skipped = classify_with_args(r#"root ::= "a"*"#, tokens, 3, args);
+
+        assert_class_refinement(&old, &skipped);
+        assert_eq!(class_of(&skipped, 1), class_of(&skipped, 0));
+        assert_ne!(class_of(&skipped, 2), class_of(&skipped, 1));
+        assert!(!skipped.invalid_tokens.contains(&2));
     }
 
     #[test]
@@ -4160,14 +4909,6 @@ mod tests {
 
     #[test]
     fn token_trie_counts_duplicate_tokens_and_subtrees() {
-        fn descend(nodes: &[TokenTrieNode], bytes: &[u8]) -> usize {
-            let mut node = 0;
-            for &byte in bytes {
-                node = nodes[node].children[&byte];
-            }
-            node
-        }
-
         let tasks = vec![
             tok("a", 10),
             tok("ab", 11),
@@ -4180,20 +4921,151 @@ mod tests {
         let counts = compute_subtree_token_counts(&trie);
 
         assert_eq!(counts[0], 6);
-        assert_eq!(counts[descend(&trie, b"a")], 4);
-        assert_eq!(counts[descend(&trie, b"ab")], 3);
-        assert_eq!(trie[descend(&trie, b"ab")].token_ids, vec![11, 12]);
+        assert_eq!(trie_token_ids_at(&trie, b"a"), vec![10]);
+        assert_eq!(trie_token_ids_at(&trie, b"ab"), vec![11, 12]);
+        assert_eq!(trie_token_ids_at(&trie, b"abc"), vec![13]);
+        assert_eq!(trie_token_ids_at(&trie, b"b"), vec![14]);
+        assert_eq!(trie_token_ids_at(&trie, b"ba"), vec![15]);
 
         let mut invalid = Vec::new();
-        collect_invalid_subtree(&trie, descend(&trie, b"a"), &mut invalid, None);
+        collect_invalid_subtree(&trie, 0, &mut invalid, None);
         invalid.sort_unstable_by_key(|result| result.token_id);
         assert_eq!(
             invalid
                 .into_iter()
                 .map(|result| (result.token_id, result.stack_pairs))
                 .collect::<Vec<_>>(),
-            vec![(10, None), (11, None), (12, None), (13, None)]
+            vec![
+                (10, None),
+                (11, None),
+                (12, None),
+                (13, None),
+                (14, None),
+                (15, None)
+            ]
         );
+    }
+
+    #[test]
+    fn compressed_token_trie_preserves_terminals_inside_long_runs() {
+        let long_spaces = vec![b' '; 35];
+        let tasks = vec![
+            (b" ".to_vec(), 1),
+            (b"  ".to_vec(), 2),
+            (b"   ".to_vec(), 3),
+            (long_spaces.clone(), 35),
+            (b"   x".to_vec(), 40),
+        ];
+        let trie = build_token_trie(&tasks);
+        let stats = compute_token_trie_stats(&trie);
+
+        assert_eq!(trie_token_ids_at(&trie, b" "), vec![1]);
+        assert_eq!(trie_token_ids_at(&trie, b"  "), vec![2]);
+        assert_eq!(trie_token_ids_at(&trie, b"   "), vec![3]);
+        assert_eq!(trie_token_ids_at(&trie, &long_spaces), vec![35]);
+        assert_eq!(trie_token_ids_at(&trie, b"   x"), vec![40]);
+        assert!(stats.raw_edges > stats.edges);
+        assert!(stats.max_homogeneous_run_len >= 32);
+    }
+
+    #[test]
+    fn advance_run_matches_byte_by_byte_factored_steps() {
+        let tokens = vec![tok(" ", 0), tok("     ", 1), tok("     x", 2)];
+        let (_, ig) = test_int_grammars(
+            r#"
+                root ::= spaces "x" | spaces
+                spaces ::= "" | " " spaces
+            "#,
+            &tokens,
+        );
+
+        let (mut reference_stacks, reference_initial) = initial_frontier(ig.start);
+        let mut reference_sets = InStackSetInterner::new();
+        let mut reference =
+            factor_frontier(&reference_initial, &reference_stacks, &mut reference_sets);
+        for depth in 1..=5 {
+            reference = advance_factored_frontier(
+                &reference,
+                b' ',
+                &ig,
+                &mut reference_stacks,
+                &mut reference_sets,
+                depth,
+                None,
+            );
+        }
+
+        let (mut run_stacks, run_initial) = initial_frontier(ig.start);
+        let mut run_sets = InStackSetInterner::new();
+        let run_frontier = factor_frontier(&run_initial, &run_stacks, &mut run_sets);
+        let first = advance_run(
+            &run_frontier,
+            b' ',
+            5,
+            &ig,
+            &mut run_stacks,
+            &mut run_sets,
+            0,
+            None,
+        );
+        let second = advance_run(
+            &run_frontier,
+            b' ',
+            5,
+            &ig,
+            &mut run_stacks,
+            &mut run_sets,
+            0,
+            None,
+        );
+
+        assert_eq!(
+            materialized_factored_frontier(&first, &run_stacks, &mut run_sets),
+            materialized_factored_frontier(&reference, &reference_stacks, &mut reference_sets)
+        );
+        assert_eq!(
+            materialized_factored_frontier(&second, &run_stacks, &mut run_sets),
+            materialized_factored_frontier(&reference, &reference_stacks, &mut reference_sets)
+        );
+    }
+
+    #[test]
+    fn cached_run_trie_traversal_matches_with_and_without_debug_stats() {
+        let tokens = vec![
+            tok(" ", 0),
+            tok("  ", 1),
+            tok("     ", 2),
+            tok("          ", 3),
+            tok("          x", 4),
+            tok("x", 5),
+            tok("<", 6),
+            tok("</", 7),
+            tok("<a", 8),
+        ];
+        let (_, ig) = test_int_grammars(
+            r#"
+                root ::= element | spaces "x"
+                element ::= "<" name attrs ">" "</" name ">"
+                attrs ::= "" | " " name "=" quote value quote attrs
+                spaces ::= "" | " " spaces
+                name ::= [A-Za-z_:] [A-Za-z0-9_.:-]*
+                value ::= [^"<&]*
+                quote ::= "\""
+            "#,
+            &tokens,
+        );
+
+        let cached =
+            materialized_token_results(&compute_stack_in_out_for_trie(&tokens, &ig, None, None));
+        let stats = TraversalStats::new();
+        let byte_by_byte = materialized_token_results(&compute_stack_in_out_for_trie(
+            &tokens,
+            &ig,
+            None,
+            Some(&stats),
+        ));
+        assert_eq!(cached, byte_by_byte);
+        assert!(stats.run_edges.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
