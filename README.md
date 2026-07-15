@@ -213,9 +213,9 @@ Experiment setup:
 
 | Grammar  | 16 threads | Single CPU core | Classes |
 |---|---:|---:|---:|
-| C++  | 1.42s | 2.53s | 3,830 |
-| bython  | 0.87s | 1.59s | 2,498 |
-| XML  | 0.69s | 1.06s | 2,262 |
+| C++  | 1.29s | 2.29s | 3,830 |
+| bython  | 0.63s | 1.58s | 2,498 |
+| XML  | 0.54s | 0.95s | 2,262 |
 
 The `--skip-repeat-bytes` option keeps complicated repeated-byte tokens as
 singleton classes. This slightly increases the compressed class vocabulary, but

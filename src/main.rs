@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokenizers::Tokenizer;
 
 type Symbol = String;
@@ -59,6 +60,8 @@ struct Args {
     cache_dir: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     no_progress: bool,
+    #[arg(long, default_value_t = false)]
+    timings: bool,
 }
 
 fn parse_range(s: &str) -> Result<(usize, usize), String> {
@@ -79,32 +82,63 @@ fn progress_style(template: &str) -> ProgressStyle {
 }
 
 fn main() -> Result<()> {
+    let total_start = Instant::now();
     let args = Args::parse();
     if args.num_threads < 1 {
         bail!("--num-threads must be >= 1");
     }
+    let setup_start = Instant::now();
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.num_threads)
         .build_global()
         .ok();
+    print_timing(&args, "thread_pool_setup", setup_start);
 
+    let read_start = Instant::now();
     let grammar_str = fs::read_to_string(&args.grammar_file)
         .with_context(|| format!("reading {}", args.grammar_file.display()))?;
-    let (tokenizer, eos_token_id) = load_tokenizer(&args)?;
-    let tokens = tokenizer_tokens(&tokenizer)?;
+    print_timing(&args, "read_grammar", read_start);
+
+    let tokenizer_load_start = Instant::now();
+    let (tokens, eos_token_id) = load_tokenizer_tokens(&args)?;
+    print_timing(&args, "load_tokenizer", tokenizer_load_start);
+
+    let n_logits_start = Instant::now();
     let n_logits = args
         .n_logits
         .unwrap_or_else(|| tokens.iter().map(|(_, id)| *id).max().unwrap_or(0) + 1);
+    print_timing(&args, "n_logits", n_logits_start);
 
+    let parse_start = Instant::now();
     let (cfg, nfa_grammar, preterms, terminal_labels) =
         parse_cfg_str(&grammar_str, &args.start_symbol)?;
+    print_timing(&args, "parse_cfg", parse_start);
+
+    let normalize_start = Instant::now();
     let normed = normalize_cfg(cfg, nfa_grammar, terminal_labels)?;
+    print_timing(&args, "normalize_cfg", normalize_start);
+
+    let classify_start = Instant::now();
     let eq = compute_token_classes(&normed, &preterms, &tokens, eos_token_id, n_logits, &args)?;
+    print_timing(&args, "compute_token_classes_total", classify_start);
+
+    let write_start = Instant::now();
     write_output(&args.output, &eq, !args.no_progress)?;
+    print_timing(&args, "write_output", write_start);
+    print_timing(&args, "total", total_start);
     Ok(())
 }
 
-fn load_tokenizer(args: &Args) -> Result<(Tokenizer, usize)> {
+fn print_timing(args: &Args, phase: &str, start: Instant) {
+    if args.timings {
+        eprintln!(
+            "cfgzip timing: {phase}_s={:.6}",
+            start.elapsed().as_secs_f64()
+        );
+    }
+}
+
+fn load_tokenizer_tokens(args: &Args) -> Result<(Vec<(Vec<u8>, usize)>, usize)> {
     let mut builder = ApiBuilder::new();
     if let Some(cache) = &args.cache_dir {
         builder = builder.with_cache_dir(cache.clone());
@@ -118,19 +152,79 @@ fn load_tokenizer(args: &Args) -> Result<(Tokenizer, usize)> {
         RepoType::Model,
         "main".to_string(),
     ));
-    let tokenizer_json = repo.get("tokenizer.json")?;
-    let tokenizer = Tokenizer::from_file(&tokenizer_json)
-        .map_err(|e| anyhow!("loading tokenizer.json: {e}"))?;
+    let tokenizer_json_path = repo.get("tokenizer.json")?;
+    let tokenizer_text = fs::read_to_string(&tokenizer_json_path)
+        .with_context(|| format!("reading {}", tokenizer_json_path.display()))?;
+    if let Ok(tokenizer_json) = serde_json::from_str::<Value>(&tokenizer_text) {
+        if let Ok(vocab) = tokenizer_vocab(&tokenizer_json) {
+            let tokens = tokenizer_tokens_from_vocab(&vocab)?;
+            let eos_token_id = discover_eos_token_id(&repo, |token| vocab.get(token).copied())
+                .ok_or_else(|| anyhow!("could not discover eos_token_id from tokenizer assets"))?;
+            return Ok((tokens, eos_token_id));
+        }
+    }
 
-    let eos_token_id = discover_eos_token_id(&repo, &tokenizer)
-        .ok_or_else(|| anyhow!("could not discover eos_token_id from tokenizer assets"))?;
-    Ok((tokenizer, eos_token_id))
+    let tokenizer = Tokenizer::from_file(&tokenizer_json_path)
+        .map_err(|e| anyhow!("loading tokenizer.json: {e}"))?;
+    let tokens = tokenizer_tokens_from_tokenizer(&tokenizer)?;
+    let eos_token_id = discover_eos_token_id(&repo, |token| {
+        tokenizer.token_to_id(token).map(|id| id as usize)
+    })
+    .ok_or_else(|| anyhow!("could not discover eos_token_id from tokenizer assets"))?;
+    Ok((tokens, eos_token_id))
 }
 
-fn discover_eos_token_id(
-    repo: &hf_hub::api::sync::ApiRepo,
-    tokenizer: &Tokenizer,
-) -> Option<usize> {
+fn tokenizer_vocab(tokenizer_json: &Value) -> Result<FastHashMap<String, usize>> {
+    let mut vocab = fast_hash_map();
+    let model_vocab = tokenizer_json
+        .get("model")
+        .and_then(|model| model.get("vocab"))
+        .ok_or_else(|| anyhow!("tokenizer.json does not contain model.vocab"))?;
+    match model_vocab {
+        Value::Object(entries) => {
+            for (token, id) in entries {
+                let id = id.as_u64().ok_or_else(|| {
+                    anyhow!("tokenizer model.vocab id for {token:?} is not an integer")
+                })?;
+                vocab.insert(token.clone(), id as usize);
+            }
+        }
+        Value::Array(entries) => {
+            for (id, entry) in entries.iter().enumerate() {
+                let token = entry
+                    .as_str()
+                    .or_else(|| {
+                        entry
+                            .as_array()
+                            .and_then(|parts| parts.first())
+                            .and_then(Value::as_str)
+                    })
+                    .ok_or_else(|| {
+                        anyhow!("tokenizer model.vocab entry {id} does not contain a token string")
+                    })?;
+                vocab.insert(token.to_string(), id);
+            }
+        }
+        _ => bail!("tokenizer.json model.vocab is neither an object nor an array"),
+    }
+    if let Some(added_tokens) = tokenizer_json.get("added_tokens").and_then(Value::as_array) {
+        for entry in added_tokens {
+            let Some(content) = entry.get("content").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(id) = entry.get("id").and_then(Value::as_u64) else {
+                continue;
+            };
+            vocab.insert(content.to_string(), id as usize);
+        }
+    }
+    Ok(vocab)
+}
+
+fn discover_eos_token_id<F>(repo: &hf_hub::api::sync::ApiRepo, token_to_id: F) -> Option<usize>
+where
+    F: Fn(&str) -> Option<usize>,
+{
     for filename in [
         "tokenizer_config.json",
         "special_tokens_map.json",
@@ -147,43 +241,56 @@ fn discover_eos_token_id(
         };
         for key in ["eos_token_id", "eos_token"] {
             if let Some(value) = json.get(key) {
-                if let Some(id) = eos_from_value(value, tokenizer) {
+                if let Some(id) = eos_from_value(value, &token_to_id) {
                     return Some(id);
                 }
             }
         }
     }
-    tokenizer.token_to_id("<|endoftext|>").map(|x| x as usize)
+    token_to_id("<|endoftext|>")
 }
 
-fn eos_from_value(v: &Value, tokenizer: &Tokenizer) -> Option<usize> {
+fn eos_from_value<F>(v: &Value, token_to_id: &F) -> Option<usize>
+where
+    F: Fn(&str) -> Option<usize>,
+{
     match v {
         Value::Number(n) => n.as_u64().map(|x| x as usize),
-        Value::String(s) => tokenizer.token_to_id(s).map(|x| x as usize),
+        Value::String(s) => token_to_id(s),
         Value::Object(m) => m
             .get("id")
             .and_then(|x| x.as_u64().map(|y| y as usize))
             .or_else(|| {
                 m.get("content")
                     .and_then(|x| x.as_str())
-                    .and_then(|s| tokenizer.token_to_id(s).map(|x| x as usize))
+                    .and_then(token_to_id)
             }),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| eos_from_value(value, token_to_id)),
         _ => None,
     }
 }
 
-fn gpt2_byte_decoder() -> HashMap<char, u8> {
-    let mut out = HashMap::new();
-    let mut n = 0u32;
-    for b in 0u32..=255 {
-        if b < 33 || (127..=160).contains(&b) || b == 173 {
-            out.insert(char::from_u32(n + 256).unwrap(), b as u8);
-            n += 1;
+fn gpt2_byte_decode_char(c: char) -> Option<u8> {
+    let x = c as u32;
+    if x <= 255 {
+        if x < 33 || (127..=160).contains(&x) || x == 173 {
+            None
         } else {
-            out.insert(char::from_u32(b).unwrap(), b as u8);
+            Some(x as u8)
         }
+    } else if (256..=323).contains(&x) {
+        let n = x - 256;
+        match n {
+            0..=32 => Some(n as u8),
+            33..=66 => Some((127 + (n - 33)) as u8),
+            67 => Some(173),
+            _ => None,
+        }
+    } else {
+        None
     }
-    out
 }
 
 fn hex_nibble(b: u8) -> Option<u8> {
@@ -203,29 +310,35 @@ fn hex_byte_token(token: &str) -> Option<u8> {
     Some((hex_nibble(bytes[3])? << 4) | hex_nibble(bytes[4])?)
 }
 
-fn token_to_bytes(token: &str, byte_decoder: &HashMap<char, u8>) -> Result<Vec<u8>> {
+fn token_to_bytes(token: &str) -> Result<Vec<u8>> {
     if let Some(byte) = hex_byte_token(token) {
         return Ok(vec![byte]);
     }
     token
         .chars()
         .map(|c| {
-            byte_decoder.get(&c).copied().ok_or_else(|| {
+            gpt2_byte_decode_char(c).ok_or_else(|| {
                 anyhow!("token contains character not in GPT-2 byte decoder: {c:?} in {token:?}")
             })
         })
         .collect()
 }
 
-fn tokenizer_tokens(tokenizer: &Tokenizer) -> Result<Vec<(Vec<u8>, usize)>> {
-    let dec = gpt2_byte_decoder();
+fn tokenizer_tokens_from_vocab(
+    vocab: &FastHashMap<String, usize>,
+) -> Result<Vec<(Vec<u8>, usize)>> {
+    let mut out = Vec::with_capacity(vocab.len());
+    for (tok, id) in vocab {
+        out.push((token_to_bytes(tok)?, *id));
+    }
+    Ok(out)
+}
+
+fn tokenizer_tokens_from_tokenizer(tokenizer: &Tokenizer) -> Result<Vec<(Vec<u8>, usize)>> {
     let vocab = tokenizer.get_vocab(true);
     let mut out = Vec::with_capacity(vocab.len());
-    for (_tok, id) in vocab {
-        let tok = tokenizer
-            .id_to_token(id)
-            .ok_or_else(|| anyhow!("missing token string for id {id}"))?;
-        out.push((token_to_bytes(&tok, &dec)?, id as usize));
+    for (tok, id) in vocab {
+        out.push((token_to_bytes(&tok)?, id as usize));
     }
     Ok(out)
 }
@@ -1777,11 +1890,11 @@ struct RawTokenTrieNode {
     token_ids: Vec<usize>,
 }
 
-fn build_raw_token_trie(tasks: &[(Vec<u8>, usize)]) -> Vec<RawTokenTrieNode> {
+fn build_raw_token_trie<T: AsRef<[u8]>>(tasks: &[(T, usize)]) -> Vec<RawTokenTrieNode> {
     let mut nodes = vec![RawTokenTrieNode::default()];
     for (tok, id) in tasks {
         let mut node = 0usize;
-        for &b in tok {
+        for &b in tok.as_ref() {
             if let Some(&next) = nodes[node].children.get(&b) {
                 node = next;
             } else {
@@ -1796,7 +1909,7 @@ fn build_raw_token_trie(tasks: &[(Vec<u8>, usize)]) -> Vec<RawTokenTrieNode> {
     nodes
 }
 
-fn build_token_trie(tasks: &[(Vec<u8>, usize)]) -> Vec<TokenTrieNode> {
+fn build_token_trie<T: AsRef<[u8]>>(tasks: &[(T, usize)]) -> Vec<TokenTrieNode> {
     fn compress_node(
         raw: &[RawTokenTrieNode],
         raw_id: usize,
@@ -2281,8 +2394,8 @@ fn collect_token_trie_jobs(
     }
 }
 
-fn compute_stack_in_out_for_trie(
-    tasks: &[(Vec<u8>, usize)],
+fn compute_stack_in_out_for_trie<T: AsRef<[u8]>>(
+    tasks: &[(T, usize)],
     ig: &IntGrammar,
     pb: Option<&ProgressBar>,
 ) -> TokenTraversalResults {
@@ -2389,6 +2502,7 @@ fn compute_token_classes(
     n_logits: usize,
     args: &Args,
 ) -> Result<EquivOut> {
+    let setup_start = Instant::now();
     let mut all = BTreeSet::new();
     all.extend(grammar.keys().cloned());
     for prods in grammar.values() {
@@ -2448,7 +2562,9 @@ fn compute_token_classes(
         backtrack_transitions,
         start: 0,
     };
+    print_timing(args, "classify_setup", setup_start);
 
+    let task_start = Instant::now();
     let ignore = |id: usize| {
         args.ignore_range
             .iter()
@@ -2460,18 +2576,20 @@ fn compute_token_classes(
     };
     let mut tasks = Vec::new();
     let mut skip_classes = Vec::new();
-    let mut tokens_sorted = tokens.to_vec();
-    tokens_sorted.sort_by_key(|(_, id)| *id);
-    for (tok, id) in &tokens_sorted {
+    let mut tokens_sorted = tokens.iter().collect::<Vec<_>>();
+    tokens_sorted.sort_unstable_by_key(|(_, id)| *id);
+    for (tok, id) in tokens_sorted {
         if ignore(*id) || *id == eos {
             continue;
         }
         if skip(tok) {
             skip_classes.push(*id);
         } else {
-            tasks.push((tok.clone(), *id));
+            tasks.push((tok.as_slice(), *id));
         }
     }
+    print_timing(args, "classify_task_filter", task_start);
+
     let pb = if !args.no_progress {
         let pb = ProgressBar::new(tasks.len() as u64);
         pb.set_style(progress_style(
@@ -2481,11 +2599,14 @@ fn compute_token_classes(
     } else {
         None
     };
+    let traversal_start = Instant::now();
     let results = compute_stack_in_out_for_trie(&tasks, &ig, pb.as_ref());
+    print_timing(args, "classify_traversal", traversal_start);
     if let Some(pb) = &pb {
         pb.finish();
     }
 
+    let bucketing_start = Instant::now();
     let bucket_pb = if !args.no_progress {
         let pb = ProgressBar::new(results.tokens.len() as u64);
         pb.set_style(progress_style(
@@ -2536,6 +2657,9 @@ fn compute_token_classes(
     if let Some(pb) = &bucket_pb {
         pb.finish();
     }
+    print_timing(args, "classify_bucketing", bucketing_start);
+
+    let output_vectors_start = Instant::now();
     let mut token_classes: Vec<Vec<usize>> = skip_classes.into_iter().map(|x| vec![x]).collect();
     let mut grouped_classes = classes.into_values().collect::<Vec<_>>();
     grouped_classes.sort_unstable_by_key(|class| class.iter().min().copied().unwrap_or(usize::MAX));
@@ -2563,6 +2687,7 @@ fn compute_token_classes(
         }
         reps[i] = best.cloned().unwrap_or_default();
     }
+    print_timing(args, "classify_output_vectors", output_vectors_start);
     Ok(EquivOut {
         token_classes: vec_out,
         invalid_tokens: invalid,
@@ -2736,6 +2861,7 @@ mod tests {
             hf_token: None,
             cache_dir: None,
             no_progress: true,
+            timings: false,
         }
     }
 
@@ -2745,6 +2871,85 @@ mod tests {
 
     fn tok_bytes(bytes: &[u8], id: usize) -> (Vec<u8>, usize) {
         (bytes.to_vec(), id)
+    }
+
+    #[test]
+    fn gpt2_byte_decoder_handles_direct_remapped_and_hex_tokens() {
+        assert_eq!(gpt2_byte_decode_char('A'), Some(b'A'));
+        assert_eq!(gpt2_byte_decode_char(' '), None);
+        assert_eq!(gpt2_byte_decode_char('\u{100}'), Some(0));
+        assert_eq!(gpt2_byte_decode_char('\u{120}'), Some(b' '));
+        assert_eq!(gpt2_byte_decode_char('\u{121}'), Some(127));
+        assert_eq!(gpt2_byte_decode_char('\u{143}'), Some(173));
+        assert_eq!(token_to_bytes("<0x0A>").unwrap(), vec![10]);
+    }
+
+    #[test]
+    fn tokenizer_vocab_reads_object_vocab_and_added_tokens() {
+        let json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "A": 0,
+                    "\u{120}": 1
+                }
+            },
+            "added_tokens": [
+                {"id": 2, "content": "<|eos|>", "special": true}
+            ]
+        });
+        let vocab = tokenizer_vocab(&json).unwrap();
+        assert_eq!(vocab.get("A"), Some(&0));
+        assert_eq!(vocab.get("\u{120}"), Some(&1));
+        assert_eq!(vocab.get("<|eos|>"), Some(&2));
+        let mut tokens = tokenizer_tokens_from_vocab(&vocab).unwrap();
+        tokens.sort();
+        assert!(tokens.contains(&(b"A".to_vec(), 0)));
+        assert!(tokens.contains(&(b" ".to_vec(), 1)));
+        assert!(tokens.contains(&(b"<|eos|>".to_vec(), 2)));
+    }
+
+    #[test]
+    fn tokenizer_vocab_reads_array_vocab_with_index_ids() {
+        let json = serde_json::json!({
+            "model": {
+                "type": "Unigram",
+                "vocab": [
+                    ["A", -1.0],
+                    ["\u{120}", -2.0]
+                ]
+            },
+            "added_tokens": []
+        });
+        let vocab = tokenizer_vocab(&json).unwrap();
+        assert_eq!(vocab.get("A"), Some(&0));
+        assert_eq!(vocab.get("\u{120}"), Some(&1));
+    }
+
+    #[test]
+    fn eos_from_value_resolves_numbers_strings_objects_and_arrays() {
+        let mut vocab = fast_hash_map();
+        vocab.insert("<|eos|>".to_string(), 7);
+        assert_eq!(
+            eos_from_value(&serde_json::json!(3), &|s| vocab.get(s).copied()),
+            Some(3)
+        );
+        assert_eq!(
+            eos_from_value(&serde_json::json!("<|eos|>"), &|s| vocab.get(s).copied()),
+            Some(7)
+        );
+        assert_eq!(
+            eos_from_value(&serde_json::json!({"content": "<|eos|>"}), &|s| vocab
+                .get(s)
+                .copied()),
+            Some(7)
+        );
+        assert_eq!(
+            eos_from_value(&serde_json::json!(["missing", "<|eos|>"]), &|s| {
+                vocab.get(s).copied()
+            }),
+            Some(7)
+        );
     }
 
     fn trie_token_ids_at(nodes: &[TokenTrieNode], bytes: &[u8]) -> Vec<usize> {
@@ -3864,10 +4069,7 @@ mod tests {
         assert_eq!(factored.len(), 1);
         assert_eq!(factored[0].control.out_stack, out);
         assert_eq!(factored[0].control.prev_symbol, None);
-        assert_eq!(
-            in_sets.members(factored[0].in_stack_set),
-            &[in_a, in_b]
-        );
+        assert_eq!(in_sets.members(factored[0].in_stack_set), &[in_a, in_b]);
 
         let mut canonical_flat = flat.clone();
         canonicalize_frontier(&mut canonical_flat, &stacks);
