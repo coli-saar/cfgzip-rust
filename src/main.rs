@@ -1505,8 +1505,9 @@ impl InStackSetInterner {
             return id;
         }
         let pushed = self
-            .members_vec(set_id)
-            .into_iter()
+            .members(set_id)
+            .iter()
+            .copied()
             .map(|stack| stacks.push(stack, sym))
             .collect::<Vec<_>>();
         let id = self.intern_vec(pushed);
@@ -1518,8 +1519,8 @@ impl InStackSetInterner {
         self.sets[set_id].len()
     }
 
-    fn members_vec(&mut self, set_id: usize) -> Vec<usize> {
-        self.sets[set_id].clone()
+    fn members(&self, set_id: usize) -> &[usize] {
+        &self.sets[set_id]
     }
 }
 
@@ -1651,8 +1652,9 @@ fn rebase_factored_frontier(
         .iter()
         .map(|state| {
             let rebased_members = in_sets
-                .members_vec(state.in_stack_set)
-                .into_iter()
+                .members(state.in_stack_set)
+                .iter()
+                .copied()
                 .map(|in_stack| rebased_stacks.intern_slice(&stacks.stacks[in_stack]))
                 .collect::<Vec<_>>();
             FactoredState {
@@ -2083,8 +2085,9 @@ fn factored_frontier_stack_pairs(
     for state in frontier {
         out.extend(
             in_sets
-                .members_vec(state.in_stack_set)
-                .into_iter()
+                .members(state.in_stack_set)
+                .iter()
+                .copied()
                 .map(|in_stack| (in_stack, state.control.out_stack)),
         );
     }
@@ -2987,11 +2990,11 @@ mod tests {
     fn materialized_factored_frontier(
         frontier: &[FactoredState],
         stacks: &StackInterner,
-        in_sets: &mut InStackSetInterner,
+        in_sets: &InStackSetInterner,
     ) -> HashSet<MaterializedState> {
         let mut out = HashSet::new();
         for state in frontier {
-            for in_stack in in_sets.members_vec(state.in_stack_set) {
+            for &in_stack in in_sets.members(state.in_stack_set) {
                 out.insert((
                     stacks.stacks[in_stack].clone(),
                     stacks.stacks[state.control.out_stack].clone(),
@@ -3754,19 +3757,20 @@ mod tests {
         let mut sets = InStackSetInterner::new();
 
         let ab = sets.intern_vec(vec![b, a, a]);
-        assert_eq!(sets.members_vec(ab), vec![a, b]);
+        assert_eq!(sets.members(ab), &[a, b]);
         assert_eq!(sets.intern_vec(vec![a, b]), ab);
 
         let c_set = sets.singleton(c);
         let abc = sets.union(ab, c_set);
         assert_eq!(sets.union(c_set, ab), abc);
-        assert_eq!(sets.members_vec(abc), vec![a, b, c]);
+        assert_eq!(sets.members(abc), &[a, b, c]);
 
         let pushed = sets.push_all(abc, 9, &mut stacks);
         assert_eq!(sets.push_all(abc, 9, &mut stacks), pushed);
         let materialized = sets
-            .members_vec(pushed)
-            .into_iter()
+            .members(pushed)
+            .iter()
+            .copied()
             .map(|stack| stacks.stacks[stack].clone())
             .collect::<Vec<_>>();
         assert_eq!(materialized, vec![vec![1, 9], vec![2, 9], vec![3, 9]]);
@@ -3861,8 +3865,8 @@ mod tests {
         assert_eq!(factored[0].control.out_stack, out);
         assert_eq!(factored[0].control.prev_symbol, None);
         assert_eq!(
-            in_sets.members_vec(factored[0].in_stack_set),
-            vec![in_a, in_b]
+            in_sets.members(factored[0].in_stack_set),
+            &[in_a, in_b]
         );
 
         let mut canonical_flat = flat.clone();
